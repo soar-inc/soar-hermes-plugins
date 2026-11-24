@@ -12,30 +12,27 @@ hermes_repo="$HOME/.hermes/hermes-agent"
 profile_dir="$HOME/.hermes/profiles/long-horizon"
 watcher_dir="$profile_dir/calendar-watcher"
 hermes_cli="$HOME/.local/bin/hermes"
-google_patch="$integration_dir/patches/google-meet.patch"
 
 test "$(git -C "$hermes_repo" rev-parse HEAD)" = 2bd378ed1b8d6bf2192cb26e0a55ff3091e6bd19
 ```
 
-Continue once the check succeeds. Inspect existing changes under `plugins/google_meet` and `plugins/soar_meet` before updating either directory. Apply the patch to the pinned Hermes build:
+Continue once the check succeeds. Before an update, pause the watcher and stop any running test bot. Compare the plugin directories against the deployed copies and review any local changes:
 
 ```bash
-if git -C "$hermes_repo" apply --reverse --check "$google_patch"; then
-  echo "Google Meet patch is already applied."
-else
-  git -C "$hermes_repo" apply --check "$google_patch" &&
-    git -C "$hermes_repo" apply "$google_patch"
-fi
+for plugin in google_meet soar_meet; do
+  if [ -d "$hermes_repo/plugins/$plugin" ]; then
+    diff -qr --exclude=__pycache__ \
+      "$hermes_repo/plugins/$plugin" "$integration_dir/plugins/$plugin"
+  fi
+done
 ```
 
-On a first install, copy in the Soar Meet source. For an existing deployment, use the diff to review any local modifications before replacing the source.
+Back up the existing plugin directories and watcher files. Then install both source directories and the two calendar files:
 
 ```bash
-if [ -d "$hermes_repo/plugins/soar_meet" ]; then
-  diff -qr --exclude=__pycache__ "$hermes_repo/plugins/soar_meet" "$integration_dir/plugins/soar_meet"
-else
-  cp -R "$integration_dir/plugins/soar_meet" "$hermes_repo/plugins/"
-fi
+for plugin in google_meet soar_meet; do
+  cp -R "$integration_dir/plugins/$plugin" "$hermes_repo/plugins/"
+done
 
 install -d -m 700 "$profile_dir/calendar-watcher" "$profile_dir/scripts"
 install -m 600 "$integration_dir/calendar-watcher/calendar_watcher.py"   "$profile_dir/calendar-watcher/calendar_watcher.py"
@@ -91,7 +88,7 @@ Google Meet saves its browser state under `workspace/meetings/auth.json`. Soar M
 "$hermes_cli" -p long-horizon cron list
 ```
 
-Preview reads the calendar without joining. Reuse **Long Horizon Calendar** if it is already present and points to `calendar-join.sh`. If the profile has no watcher job, create one:
+Preview reads the calendar without joining. Reuse **Long Horizon Calendar** if it is already present and points to `calendar-join.sh`. Resume it if you paused it for the update. If the profile has no watcher job, create one:
 
 ```bash
 "$hermes_cli" -p long-horizon cron create 'every 1m'   --name 'Long Horizon Calendar' --script calendar-join.sh --no-agent --deliver local

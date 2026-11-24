@@ -1,15 +1,15 @@
 # Soar Hermes Meet plugins
 
-This repository packages the Hermes-based meeting bot deployed on `chris-hermes` under the `long-horizon` profile. It includes Soar Meet support, changes to the upstream Google Meet plugin, and one calendar watcher for both providers.
+This repository packages the Hermes-based meeting bot deployed on `chris-hermes` under the `long-horizon` profile. It includes the full Google Meet and Soar Meet plugin source from the VM and one calendar watcher for both providers.
 
 | Path | Contents |
 | --- | --- |
 | [plugins/soar_meet](plugins/soar_meet) | Soar Meet browser participant, sign-in, transcripts and voice lifecycle |
-| [patches/google-meet.patch](patches/google-meet.patch) | Google Meet Realtime GA, caption and wake-chat changes, plus shared helpers used by Soar Meet |
+| [plugins/google_meet](plugins/google_meet) | The deployed Google Meet plugin, including Realtime GA, captions, wake chat and helpers shared with Soar Meet |
 | [calendar-watcher](calendar-watcher) | Google Calendar watcher and the Hermes cron launcher |
 | [docs/deploy-chris-hermes.md](docs/deploy-chris-hermes.md) | Installation, credentials, scheduler and verification for the existing VM |
 
-The patch targets [Hermes Agent commit `2bd378ed1b8d6bf2192cb26e0a55ff3091e6bd19`](https://github.com/NousResearch/hermes-agent/commit/2bd378ed1b8d6bf2192cb26e0a55ff3091e6bd19) (v0.23.0). Apply the patch and deploy the Soar Meet plugin together. The upstream Hermes license is included in [LICENSE.hermes-agent](LICENSE.hermes-agent).
+Both plugins run on [Hermes Agent commit `2bd378ed1b8d6bf2192cb26e0a55ff3091e6bd19`](https://github.com/NousResearch/hermes-agent/commit/2bd378ed1b8d6bf2192cb26e0a55ff3091e6bd19) (v0.23.0). Install the two plugin directories together. The upstream Hermes license is included in [LICENSE.hermes-agent](LICENSE.hermes-agent).
 
 ## How the calendar flow works
 
