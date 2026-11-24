@@ -1,0 +1,893 @@
+diff --git a/plugins/google_meet/__init__.py b/plugins/google_meet/__init__.py
+index 750d7af..d83bc0d 100644
+--- a/plugins/google_meet/__init__.py
++++ b/plugins/google_meet/__init__.py
+@@ -29,14 +29,14 @@ _TOOLS = (
+     ("meet_say",        MEET_SAY_SCHEMA,        handle_meet_say,        "🗣️"))
+ 
+ 
+-def _on_session_end(**kwargs) -> None:
+-    """Leave a still-running call so we don't orphan a headless Chromium (never raises)."""
++def _on_session_finalize(*, session_id: str | None = None, **kwargs) -> None:
++    """Clean up a call owned by the conversation that is closing."""
++    if not session_id:
++        return
+     try:
+-        status = pm.status()
+-        if status.get("ok") and status.get("alive"):
+-            pm.stop(reason="session ended")
++        pm.stop(reason="owning session finalized", expected_session_id=session_id)
+     except Exception as e:  # pragma: no cover — defensive
+-        logger.debug("google_meet on_session_end cleanup failed: %s", e)
++        logger.debug("google_meet on_session_finalize cleanup failed: %s", e)
+ 
+ 
+ def register(ctx) -> None:
+@@ -54,4 +54,4 @@ def register(ctx) -> None:
+         setup_fn=_register_meet_cli, handler_fn=_meet_command,
+         description=("Let the hermes agent join a Google Meet call and scrape live "
+                      "captions into a transcript. See: hermes meet setup"))
+-    ctx.register_hook("on_session_end", _on_session_end)
++    ctx.register_hook("on_session_finalize", _on_session_finalize)
+diff --git a/plugins/google_meet/cli.py b/plugins/google_meet/cli.py
+index aec5410..e67dd14 100644
+--- a/plugins/google_meet/cli.py
++++ b/plugins/google_meet/cli.py
+@@ -60,6 +60,13 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
+     p["join"].add_argument("--headed", action="store_true", help="show browser")
+     p["join"].add_argument("--mode", choices=("transcribe", "realtime"), default="transcribe",
+                            help="transcribe (default, listen-only) or realtime (speak via OpenAI Realtime)")
++    p["join"].add_argument("--wake", action="store_true",
++                           help='Answer wake questions in Meet captions (default phrase: "Hey Horizon").')
++    wake_chat_mode = p["join"].add_mutually_exclusive_group()
++    wake_chat_mode.add_argument("--wake-session", metavar="SESSION_ID",
++                                help="Use and remember a dedicated Hermes chat (requires --wake).")
++    wake_chat_mode.add_argument("--resume-wake-chat", action="store_true",
++                                help="Use the chat saved for this Meet code (requires --wake).")
+     p["join"].add_argument("--node", default=None,
+                            help="remote node name, or 'auto' to use the sole registered node")
+     p["transcript"].add_argument("--last", type=int, default=None)
+@@ -74,7 +81,8 @@ _DISPATCH = {
+     "install": lambda a: _cmd_install(realtime=bool(a.realtime), assume_yes=bool(a.yes)),
+     "auth": lambda a: _cmd_auth(),
+     "join": lambda a: _cmd_join(url=a.url, guest_name=a.guest_name, duration=a.duration, headed=a.headed,
+-                                mode=a.mode, node=a.node),
++                                mode=a.mode, node=a.node, wake=a.wake, wake_session=a.wake_session,
++                                resume_wake_chat=a.resume_wake_chat),
+     "status": lambda a: _print_result(pm.status()),
+     "transcript": lambda a: _cmd_transcript(last=a.last),
+     "say": lambda a: _cmd_say(text=a.text, node=a.node),
+@@ -245,16 +253,35 @@ def _remote(node: str, op: str, call) -> int:
+ 
+ 
+ def _cmd_join(url: str, *, guest_name: str, duration: Optional[str], headed: bool,
+-              mode: str = "transcribe", node: Optional[str] = None) -> int:
++              mode: str = "transcribe", node: Optional[str] = None, wake: bool = False,
++              wake_session: Optional[str] = None, resume_wake_chat: bool = False) -> int:
+     if not _is_safe_meet_url(url):
+         print(f"refusing: not a meet.google.com URL: {url}")
+         return 2
++    if wake and (mode != "realtime" or node):
++        return _print_result({"ok": False, "error": "--wake requires local --mode realtime"})
++    if wake_session is not None or resume_wake_chat:
++        if not wake:
++            return _print_result({"ok": False, "error": "Wake chat options require --wake"})
++        from plugins.google_meet.wake_chat import load_meeting_chat, remember_meeting_chat, validate_wake_chat
++
++        try:
++            if resume_wake_chat:
++                wake_session = load_meeting_chat(url)
++            validate_wake_chat(wake_session)
++            if not resume_wake_chat:
++                remember_meeting_chat(url, wake_session)
++        except OSError:
++            return _print_result({"ok": False, "error": "Could not save the wake chat for this meeting."})
++        except ValueError as exc:
++            return _print_result({"ok": False, "error": str(exc)})
+     if node:
+         return _remote(node, "start_bot", lambda c: c.start_bot(
+             url=url, guest_name=guest_name, duration=duration, headed=headed, mode=mode))
+     auth = _auth_state_path()
+     return _print_result(pm.start(url=url, headed=headed, guest_name=guest_name, duration=duration,
+-                                  auth_state=str(auth) if auth.is_file() else None, mode=mode))
++                                  auth_state=str(auth) if auth.is_file() else None, mode=mode, wake=wake,
++                                  wake_session=wake_session))
+ 
+ 
+ def _cmd_say(text: str, node: Optional[str] = None) -> int:
+diff --git a/plugins/google_meet/meet_bot.py b/plugins/google_meet/meet_bot.py
+index 277c1ea..f00f3df 100644
+--- a/plugins/google_meet/meet_bot.py
++++ b/plugins/google_meet/meet_bot.py
+@@ -23,6 +23,7 @@ from types import SimpleNamespace
+ from typing import Optional
+ 
+ from hermes_cli.browser_runtime import chromium_executable
++from plugins.google_meet.wake_caption import CaptionWake
+ from utils import atomic_json_write
+ 
+ # Short three-segment code, a lookup URL, or /new. Anything else is rejected.
+@@ -64,6 +65,8 @@ _STATUS_FIELDS = (
+     ("realtime", "realtime", False), ("realtimeReady", "realtime_ready", False),
+     ("realtimeDevice", "realtime_device", None), ("audioBytesOut", "audio_bytes_out", 0),
+     ("lastAudioOutAt", "last_audio_out_at", None), ("lastBargeInAt", "last_barge_in_at", None),
++    ("wakeEnabled", "wake_enabled", False), ("wakeQuestions", "wake_questions", 0),
++    ("wakeError", "wake_error", None), ("wakeSessionId", "wake_session_id", None),
+     ("leaveReason", "leave_reason", None), ("micState", "mic_state", None))
+ 
+ 
+@@ -108,17 +111,24 @@ _CAPTION_OBSERVER_JS = r"""
+   if (window.__hermesMeetInstalled) return;
+   window.__hermesMeetInstalled = true;
+   window.__hermesMeetQueue = [];
++  const rowsSeen = new WeakMap();
++  let nextRow = 0;
+ 
+   const captionSelector = '[role="region"][aria-label*="aption" i], ' +
+                           'div[jsname="YSxPC"], ' +  // legacy
+                           'div[jsname="tgaKEf"]';    // current (Apr 2026)
+ 
+-  function pushEntry(speaker, text) {
+-    if (!text || !text.trim()) return;
++  function pushEntry(element, speaker, text) {
++    speaker = (speaker || '').trim();
++    text = (text || '').trim();
++    const previous = rowsSeen.get(element);
++    if (previous && previous.speaker === speaker && previous.text === text) return;
++    const sameSpeaker = previous && previous.speaker === speaker;
++    const row = sameSpeaker ? previous.row : ++nextRow;
++    rowsSeen.set(element, { row, speaker, text });
++    if (!text) return;
+     window.__hermesMeetQueue.push({
+-      ts: Date.now(),
+-      speaker: (speaker || '').trim(),
+-      text: text.trim(),
++      ts: Date.now(), row, speaker, text, previous: sameSpeaker ? previous.text : '',
+     });
+   }
+ 
+@@ -130,27 +140,27 @@ _CAPTION_OBSERVER_JS = r"""
+       rows.forEach((row) => {
+         const spkEl = row.querySelector('div.KcIKyf, div.zs7s8d, span[jsname="YSxPC"]');
+         const txtEl = row.querySelector('div.bh44bd, span[jsname="tgaKEf"], div.iTTPOb');
+-        pushEntry(spkEl ? spkEl.innerText : '', txtEl ? txtEl.innerText : row.innerText);
++        pushEntry(row, spkEl ? spkEl.innerText : '', txtEl ? txtEl.innerText : row.innerText);
+       });
+       return;
+     }
+     // Fallback: treat the whole region's innerText as one anonymous line.
+-    pushEntry('', (root.innerText || '').split('\n').filter(Boolean).pop());
++    pushEntry(root, '', (root.innerText || '').split('\n').filter(Boolean).pop());
+   }
+ 
++  let attached = null;
++  const observer = new MutationObserver(() => { if (attached) scan(attached); });
+   function attach() {
+-    const el = document.querySelector(captionSelector);
+-    if (!el) return false;
+-    new MutationObserver(() => scan(el)).observe(el, { childList: true, subtree: true, characterData: true });
+-    scan(el);
+-    return true;
+-  }
+-
+-  // Retry on interval — the caption region only appears after captions are
+-  // enabled and someone speaks.
+-  if (!attach()) {
+-    const iv = setInterval(() => { if (attach()) clearInterval(iv); }, 1500);
++    const region = document.querySelector(captionSelector);
++    if (region === attached) return;
++    observer.disconnect();
++    attached = region;
++    if (!region) return;
++    observer.observe(region, { childList: true, subtree: true, characterData: true });
++    scan(region);
+   }
++  attach();
++  setInterval(attach, 500);
+ 
+   window.__hermesMeetDrain = () => {
+     const out = window.__hermesMeetQueue.slice();
+@@ -160,11 +170,6 @@ _CAPTION_OBSERVER_JS = r"""
+ })();
+ """
+ 
+-# Best-effort caption toggle: Meet binds it to the ``c`` key; click targeting is too brittle.
+-_ENABLE_CAPTIONS_JS = (
+-    "(() => { document.body.dispatchEvent(new KeyboardEvent('keydown', "
+-    "{ key: 'c', code: 'KeyC', keyCode: 67, which: 67, bubbles: true })); return true; })();")
+-
+ _LEAVE_CALL_JS = (
+     "() => { const b = document.querySelector('button[aria-label*=\"eave call\"]');"
+     " if (b) b.click(); }")
+@@ -180,6 +185,29 @@ _ADMISSION_PROBE_JS = r"""
+     })();
+     """
+ 
++# Read the People control's total rather than counting visible video tiles.
++_PARTICIPANT_COUNT_JS = r"""
++    () => {
++      const visible = (node) => node.getClientRects().length > 0
++        && getComputedStyle(node).visibility === "visible";
++      if (![...document.querySelectorAll('button[aria-label*="eave call" i]')].some(visible)) {
++        return null;
++      }
++      const counts = new Set();
++      for (const button of document.querySelectorAll('button[aria-label], [role="button"][aria-label]')) {
++        const label = button.getAttribute("aria-label").trim();
++        const match = /^(?:Show everyone|People|Participants)(?:\s*\(\s*(\d+)\s*\))?$/i.exec(label);
++        if (!match || !visible(button)) continue;
++        const text = button.innerText.trim();
++        const badge = /^(?:(?:people|group|groups|person)\s+)?(\d+)$/i.exec(text);
++        if (match[1]) counts.add(Number(match[1]));
++        if (badge) counts.add(Number(badge[1]));
++      }
++      return counts.size === 1 ? [...counts][0] : null;
++    }
++    """
++
++
+ # English only — what Meet shows when the host denies or removes a guest.
+ _DENIED_PROBE_JS = r"""
+     (() => {
+@@ -221,14 +249,14 @@ def _pcm_tail_loop(proc, pcm_path: Path, stop_flag: dict, poll_interval: float =
+ def _start_pcm_pump(rt: dict, bridge_info: dict, pcm_path: Path, state: _BotState,
+                     stop_flag: dict) -> None:
+     """Stream the growing ``speaker.pcm`` (24kHz s16le mono) into the device Chrome's fake mic reads.
+-    The pump reads raw PCM from stdin (``-``) so audio appended after start-up is still played —
++    The pump reads raw PCM from stdin so audio appended after start-up is still played —
+     pointed at the file it would read the empty sink to EOF and exit before Realtime spoke."""
+     bridge_info = bridge_info or {}
+     platform_tag = bridge_info.get("platform")
+     target = bridge_info.get("write_target")
+     if platform_tag == "linux":
+         cmd = ["paplay", "--raw", "--rate=24000", "--format=s16le", "--channels=1",
+-               f"--device={target or 'hermes_meet_sink'}", "-"]
++               f"--device={target or 'hermes_meet_sink'}"]
+         missing = "paplay not found — install pulseaudio-utils for realtime on Linux"
+     elif platform_tag == "darwin":
+         # User must have BlackHole as default input; ffmpeg targets it by audiotoolbox index.
+@@ -385,12 +413,33 @@ def _ensure_mic_on(page) -> str:
+     return "unknown"
+ 
+ 
++def _start_captions(page, state: _BotState) -> None:
++    """Observe captions and turn them on in the admitted bot's own browser."""
++    try:
++        page.evaluate(_CAPTION_OBSERVER_JS)
++        state.set(captioning=True)
++        if _visible(page.get_by_role("button", name=re.compile(r"(turn off|hide) captions", re.I))):
++            return
++        toggle = _visible(page.get_by_role("button", name=re.compile(r"(turn on|show) captions", re.I)))
++        if toggle is not None:
++            toggle.click(timeout=3_000)
++        else:
++            page.keyboard.press("c")
++        state.set(captions_enabled_attempted=True)
++    except Exception as exc:
++        state.set(error=f"caption setup failed: {exc}")
++
++
+ def _drain_loop(page, cfg: _BotConfig, state: _BotState, rt: dict, stop_flag: dict) -> None:
+     """Admission + caption drain loop until SIGTERM, duration expiry, lobby timeout/denial or page loss.
+     Sets ``leave_reason`` for every exit but SIGTERM; triggers barge-in; mirrors realtime counters."""
+     deadline = (time.time() + cfg.duration_s) if cfg.duration_s else None
+     lobby_deadline = time.time() + cfg.lobby_timeout
+     last_admission_check = 0.0
++    next_participant_check = 0.0
++    had_company = False
++    alone_since = None
++    wake = rt.get("wake")
+     while not stop_flag["stop"]:
+         now = time.time()
+         if deadline and now > deadline:
+@@ -400,6 +449,7 @@ def _drain_loop(page, cfg: _BotConfig, state: _BotState, rt: dict, stop_flag: di
+             last_admission_check = now
+             if _probe(page, _ADMISSION_PROBE_JS):
+                 state.set(in_call=True, lobby_waiting=False, joined_at=now, mic_state=_ensure_mic_on(page))
++                _start_captions(page, state)
+             elif now > lobby_deadline:
+                 waited = int(lobby_deadline - state.join_attempted_at) if state.join_attempted_at else 0
+                 state.set(error=f"lobby timeout — host never admitted the bot within {waited}s",
+@@ -408,11 +458,27 @@ def _drain_loop(page, cfg: _BotConfig, state: _BotState, rt: dict, stop_flag: di
+             elif _probe(page, _DENIED_PROBE_JS):
+                 state.set(error="host denied admission", leave_reason="denied")
+                 return
++        if state.in_call and time.monotonic() >= next_participant_check:
++            participants = _quiet(page.evaluate, _PARTICIPANT_COUNT_JS)
++            checked_at = time.monotonic()
++            next_participant_check = checked_at + 5
++            if type(participants) is int and participants > 1:
++                had_company = True
++            if had_company and type(participants) is int and participants == 1:
++                if alone_since is None:
++                    alone_since = checked_at
++                elif checked_at - alone_since >= 15:
++                    state.set(leave_reason="all_participants_left")
++                    return
++            else:
++                alone_since = None
+         try:
+             queued = page.evaluate("window.__hermesMeetDrain && window.__hermesMeetDrain()")
+             for entry in (e for e in (queued if isinstance(queued, list) else ()) if isinstance(e, dict)):
+                 speaker = str(entry.get("speaker", ""))
+                 state.record_caption(speaker=speaker, text=str(entry.get("text", "")))
++                if wake is not None and state.in_call:
++                    wake.observe(entry, time.monotonic())
+                 # Barge-in: a real human spoke while we may be generating audio.
+                 if (rt["session"] is not None and _looks_like_human_speaker(speaker, cfg.guest_name)
+                         and _quiet(rt["session"].cancel_response)):
+@@ -421,6 +487,8 @@ def _drain_loop(page, cfg: _BotConfig, state: _BotState, rt: dict, stop_flag: di
+             if page.is_closed():  # Meet reloaded or we got booted — exit rather than spin
+                 state.set(leave_reason="page_closed")
+                 return
++        if wake is not None and state.in_call:
++            wake.poll(state, time.monotonic())
+         if rt["session"] is not None:
+             state.set(audio_bytes_out=rt["session"].audio_bytes_out,
+                       last_audio_out_at=rt["session"].last_audio_out_at)
+@@ -485,16 +553,13 @@ def run_bot() -> int:
+                 state.set(error=f"navigate failed: {e}", exited=True)
+                 return 4
+             _join(page, cfg, state)
+-            if _quiet(page.evaluate, _ENABLE_CAPTIONS_JS):
+-                state.set(captions_enabled_attempted=True)
+-            try:
+-                page.evaluate(_CAPTION_OBSERVER_JS)
+-            except Exception as e:
+-                state.set(error=f"caption observer install failed: {e}")
+-            # in_call stays False until admission is confirmed by the drain loop.
+-            state.set(captioning=True, join_attempted_at=time.time())
++            state.set(join_attempted_at=time.time())
+             if rt["enabled"]:
+                 _start_realtime_speaker(rt, cfg, stop_flag, state)
++                if state.realtime_ready and os.environ.get("HERMES_MEET_WAKE") == "1":
++                    wake_session = os.environ.get("HERMES_MEET_WAKE_SESSION") or None
++                    rt["wake"] = CaptionWake(cfg.guest_name, cfg.out_dir, wake_session=wake_session)
++                    state.set(wake_enabled=True, wake_session_id=wake_session)
+             _drain_loop(page, cfg, state, rt, stop_flag)
+             _quiet(page.evaluate, _LEAVE_CALL_JS)
+             context.close()
+diff --git a/plugins/google_meet/plugin.yaml b/plugins/google_meet/plugin.yaml
+index 0d6b2e0..c189f13 100644
+--- a/plugins/google_meet/plugin.yaml
++++ b/plugins/google_meet/plugin.yaml
+@@ -13,4 +13,4 @@ provides_tools:
+   - meet_transcript
+   - meet_say
+ provides_hooks:
+-  - on_session_end
++  - on_session_finalize
+diff --git a/plugins/google_meet/process_manager.py b/plugins/google_meet/process_manager.py
+index c6dc08b..1f63132 100644
+--- a/plugins/google_meet/process_manager.py
++++ b/plugins/google_meet/process_manager.py
+@@ -65,7 +65,8 @@ def start(url: str, *, out_dir: Optional[Path] = None, headed: bool = False,
+           auth_state: Optional[str] = None, guest_name: str = "Hermes Agent", duration: Optional[str] = None,
+           session_id: Optional[str] = None, mode: str = "transcribe", realtime_model: Optional[str] = None,
+           realtime_voice: Optional[str] = None, realtime_instructions: Optional[str] = None,
+-          realtime_api_key: Optional[str] = None) -> dict[str, Any]:
++          realtime_api_key: Optional[str] = None, wake: bool = False,
++          wake_session: Optional[str] = None) -> dict[str, Any]:
+     """Spawn the meet_bot subprocess for *url*, stopping any running bot first (one active meeting)."""
+     from plugins.google_meet.meet_bot import _is_safe_meet_url, _meeting_id_from_url
+     if not _is_safe_meet_url(url):
+@@ -80,7 +81,9 @@ def start(url: str, *, out_dir: Optional[Path] = None, headed: bool = False,
+         with contextlib.suppress(OSError):
+             (out / name).unlink()
+     env = {**os.environ, "HERMES_MEET_URL": url, "HERMES_MEET_OUT_DIR": str(out),
+-           "HERMES_MEET_GUEST_NAME": guest_name}
++           "HERMES_MEET_GUEST_NAME": guest_name,
++           "HERMES_MEET_WAKE": "1" if wake else "0",
++           "HERMES_MEET_WAKE_SESSION": wake_session or ""}
+     for value, var in (
+         (headed and "1", "HERMES_MEET_HEADED"),
+         (auth_state, "HERMES_MEET_AUTH_STATE"),
+@@ -175,18 +178,25 @@ def enqueue_say(text: str) -> dict[str, Any]:
+     if not out_dir.is_dir():
+         return {"ok": False, "reason": f"out_dir missing: {out_dir}"}
+     queue_path = out_dir / "say_queue.jsonl"
+-    entry = {"id": uuid.uuid4().hex[:12], "text": text}
+-    with say_queue_lock(queue_path), queue_path.open("a", encoding="utf-8") as f:
+-        f.write(json.dumps(entry) + "\n")
+-    return {"ok": True, "meetingId": active.get("meeting_id"), "enqueued_id": entry["id"],
++    entry_id = append_say(queue_path, text)
++    return {"ok": True, "meetingId": active.get("meeting_id"), "enqueued_id": entry_id,
+             "queue_path": str(queue_path)}
+ 
+ 
+-def stop(*, reason: str = "requested") -> dict[str, Any]:
++def append_say(queue_path: Path, text: str) -> str:
++    entry = {"id": uuid.uuid4().hex[:12], "text": text}
++    with say_queue_lock(queue_path), queue_path.open("a", encoding="utf-8") as queue:
++        queue.write(json.dumps(entry) + "\n")
++    return entry["id"]
++
++
++def stop(*, reason: str = "requested", expected_session_id: Optional[str] = None) -> dict[str, Any]:
+     """SIGTERM the active bot (SIGKILL after 10s), then clear the active pointer."""
+     active = _read_active()
+     if not active:
+         return dict(_NO_ACTIVE)
++    if expected_session_id is not None and active.get("session_id") != expected_session_id:
++        return {"ok": False, "reason": "active meeting belongs to a different session"}
+     pid = int(active.get("pid", 0))
+     out_dir = active.get("out_dir")
+     if _pid_alive(pid):
+diff --git a/plugins/google_meet/realtime/openai_client.py b/plugins/google_meet/realtime/openai_client.py
+index 1344273..7221b36 100644
+--- a/plugins/google_meet/realtime/openai_client.py
++++ b/plugins/google_meet/realtime/openai_client.py
+@@ -48,22 +48,42 @@ class RealtimeSession:
+         self.last_audio_out_at: Optional[float] = None
+ 
+     def connect(self) -> None:
+-        """Open the WS and send ``session.update`` with voice + instructions."""
++        """Open the WebSocket and wait for OpenAI to accept the audio settings."""
+         try:
+             from websockets.sync.client import connect  # type: ignore
+         except ImportError as exc:  # pragma: no cover - exercised via test
+             raise RuntimeError("websockets package is required for OpenAI Realtime; "
+                                "install with: pip install websockets") from exc
+         url = f"{REALTIME_URL}?model={self.model}"
+-        headers = [("Authorization", f"Bearer {self.api_key}"), ("OpenAI-Beta", "realtime=v1")]
++        headers = [("Authorization", f"Bearer {self.api_key}")]
+         # Newer websockets takes additional_headers=, older extra_headers=.
+         try:
+             self._ws = connect(url, additional_headers=headers)
+         except TypeError:
+             self._ws = connect(url, extra_headers=headers)
+-        self._send_json({"type": "session.update", "session": {
+-            "voice": self.voice, "instructions": self.instructions, "modalities": ["audio", "text"],
+-            "output_audio_format": "pcm16", "input_audio_format": "pcm16"}})
++        try:
++            self._send_json({"type": "session.update", "session": {
++                "type": "realtime",
++                "instructions": self.instructions,
++                "output_modalities": ["audio"],
++                "audio": {"output": {
++                    "voice": self.voice,
++                    "format": {"type": "audio/pcm", "rate": self.sample_rate},
++                }},
++            }})
++            timeout = 10.0
++            deadline = time.monotonic() + timeout
++            while True:
++                frame = self._recv_frame(deadline, timeout)
++                if frame is None:
++                    raise RuntimeError("realtime connection closed before session settings were accepted")
++                if frame.get("type") == "session.updated":
++                    return
++                if frame.get("type") == "error":
++                    raise RuntimeError(f"realtime session update failed: {frame.get('error') or frame}")
++        except Exception:
++            self.close()
++            raise
+ 
+     def close(self) -> None:
+         if self._ws is not None:
+@@ -79,7 +99,7 @@ class RealtimeSession:
+         start = time.monotonic()
+         self._send_json({"type": "conversation.item.create", "item": {
+             "type": "message", "role": "user", "content": [{"type": "input_text", "text": text}]}})
+-        self._send_json({"type": "response.create", "response": {"modalities": ["audio"]}})
++        self._send_json({"type": "response.create", "response": {"output_modalities": ["audio"]}})
+         bytes_written = 0
+         with contextlib.ExitStack() as stack:
+             sink_fp = None
+@@ -94,7 +114,7 @@ class RealtimeSession:
+                 if ftype == "error":
+                     raise RuntimeError(f"realtime error: {frame.get('error') or frame}")
+                 chunk = _decode_audio(frame.get("delta") or frame.get("audio") or "") if (
+-                    ftype == "response.audio.delta" and sink_fp is not None) else b""
++                    ftype == "response.output_audio.delta" and sink_fp is not None) else b""
+                 if chunk:
+                     sink_fp.write(chunk)
+                     sink_fp.flush()
+diff --git a/plugins/google_meet/tools.py b/plugins/google_meet/tools.py
+index 1dd7be8..42f2218 100644
+--- a/plugins/google_meet/tools.py
++++ b/plugins/google_meet/tools.py
+@@ -146,7 +146,7 @@ def handle_meet_join(args: dict[str, Any], **_kw) -> str:
+             return {"ok": False, "error": (
+                 "google_meet plugin prerequisites missing — install with "
+                 "`hermes meet install`. Plugin is supported on Linux and macOS only.")}
+-        return pm.start(**common)
++        return pm.start(**common, session_id=_kw.get("session_id"))
+ 
+     return _dispatch(args.get("node"), "start_bot", lambda c: c.start_bot(**common), _local)
+ 
+diff --git a/plugins/google_meet/wake_caption.py b/plugins/google_meet/wake_caption.py
+new file mode 100644
+index 0000000..498af49
+--- /dev/null
++++ b/plugins/google_meet/wake_caption.py
+@@ -0,0 +1,155 @@
++"""Answer opt-in wake questions collected from live Google Meet captions."""
++
++from __future__ import annotations
++
++import re
++import threading
++from pathlib import Path
++from queue import Empty, SimpleQueue
++
++_PUNCTUATION = " ,.!?;:—–-"
++
++
++def _answer(question: str) -> str:
++    from agent.auxiliary_client import call_llm
++    from agent.secret_scope import build_profile_secret_scope, reset_secret_scope, set_secret_scope
++    from hermes_cli.config import load_config
++    from hermes_cli.runtime_provider import resolve_runtime_provider
++    from hermes_constants import get_hermes_home
++
++    home = Path(get_hermes_home())
++    token = set_secret_scope(build_profile_secret_scope(home), profile_home=str(home))
++    try:
++        model_config = load_config().get("model")
++        model = model_config.get("default") if isinstance(model_config, dict) else model_config
++        runtime = resolve_runtime_provider(target_model=model)
++        response = call_llm(
++            task="meet_wake",
++            provider=runtime["provider"],
++            model=model,
++            base_url=runtime.get("base_url"),
++            api_key=runtime.get("api_key"),
++            api_mode=runtime.get("api_mode"),
++            main_runtime=runtime,
++            timeout=20,
++            messages=[
++                {"role": "system", "content": "Answer the meeting attendee in one short spoken sentence. "
++                 "Use general knowledge. Do not repeat the wake phrase."},
++                {"role": "user", "content": question},
++            ],
++        )
++        return " ".join((response.choices[0].message.content or "").split())[:650]
++    finally:
++        reset_secret_scope(token)
++
++
++class CaptionWake:
++    def __init__(self, bot_name: str, out_dir: Path, *, wake_session: str | None = None,
++                 wake_name: str | None = None, wake_aliases: tuple[str, ...] = ()) -> None:
++        word = wake_name
++        if word is None:
++            from hermes_cli.config import load_config_readonly
++
++            options = load_config_readonly().get("plugins", {}).get("entries", {}).get("google_meet", {})
++            word = options.get("wake_word", "Horizon")
++            aliases = options.get("wake_aliases", [])
++            if isinstance(aliases, list):
++                wake_aliases = (*wake_aliases, *aliases)
++        if not isinstance(word, str) or not word.isalpha():
++            word = "Horizon"
++        words = [word]
++        words.extend(alias for alias in wake_aliases if isinstance(alias, str) and alias.isalpha())
++        alternatives = "|".join(re.escape(word) for word in words)
++        self._wake = re.compile(rf"\bhey[\s,.:!?—–-]+(?:{alternatives})\b", re.IGNORECASE)
++        self._split_wake = re.compile(rf"(?:{alternatives})\b", re.IGNORECASE)
++        self._bot_names = {bot_name.strip().casefold(), "you"} - {""}
++        self._queue_path = out_dir / "say_queue.jsonl"
++        self._wake_session = wake_session
++        self._speaker: str | None = None
++        self._parts: dict[int, str] = {}
++        self._marker_row = -1
++        self._last: tuple[str, int, str, float] | None = None
++        self._updated = 0.0
++        self._working = False
++        self._results: SimpleQueue[tuple[str, str | None]] = SimpleQueue()
++
++    def observe(self, entry: dict, now: float) -> None:
++        row = entry.get("row")
++        text = " ".join(str(entry.get("text", "")).split())
++        speaker = str(entry.get("speaker", "")).strip().casefold()
++        if not isinstance(row, int) or not text or speaker in self._bot_names or speaker.endswith(" (you)"):
++            return
++
++        matches = list(self._wake.finditer(text))
++        previous = " ".join(str(entry.get("previous", "")).split())
++        fresh = len(matches) > len(list(self._wake.finditer(previous)))
++        after_wake = text[matches[-1].end():].lstrip(_PUNCTUATION) if matches else ""
++        # Captions can split the two wake words across adjacent rows.
++        if not matches and self._last is not None:
++            last_speaker, last_row, last_text, last_at = self._last
++            split = self._split_wake.match(text)
++            if (split and row > last_row and speaker == last_speaker and now - last_at < 3
++                    and re.search(r"\bhey[,.:!?]?$", last_text, re.IGNORECASE)):
++                fresh = True
++                after_wake = text[split.end():].lstrip(_PUNCTUATION)
++        self._last = (speaker, row, text, now)
++
++        if fresh:
++            self._speaker, self._marker_row = speaker, row
++            self._parts = {row: after_wake}
++            self._updated = now
++        elif self._speaker == speaker and row >= self._marker_row and now - self._updated < 6:
++            if row == self._marker_row:
++                if matches:
++                    self._parts[row] = after_wake
++                elif (split := self._split_wake.match(text)):
++                    self._parts[row] = text[split.end():].lstrip(_PUNCTUATION)
++                else:
++                    return
++            elif not matches:
++                self._parts[row] = text
++            else:
++                return
++            self._updated = now
++
++    def poll(self, state, now: float) -> None:
++        if self._working:
++            try:
++                answer, error = self._results.get_nowait()
++            except Empty:
++                return
++            self._working = False
++            if answer:
++                from plugins.google_meet.process_manager import append_say
++                try:
++                    append_say(self._queue_path, answer)
++                except (OSError, TimeoutError):
++                    error = "Could not queue the spoken response."
++            state.set(wake_error=error)
++
++        if self._speaker is None:
++            return
++        question = " ".join(part for _, part in sorted(self._parts.items()) if part)[:500]
++        if now - self._updated < (2 if question else 6):
++            return
++        self._speaker, self._parts = None, {}
++        if not question:
++            return
++        state.set(wake_questions=state.wake_questions + 1, wake_error=None)
++        self._working = True
++        threading.Thread(target=self._answer, args=(question,), name="meet-wake", daemon=True).start()
++
++    def _answer(self, question: str) -> None:
++        try:
++            if self._wake_session:
++                from plugins.google_meet.wake_chat import answer_in_chat
++
++                answer = answer_in_chat(self._wake_session, question)
++            else:
++                answer = _answer(question)
++            self._results.put((answer, None if answer else "The profile model returned an empty answer."))
++        except Exception as exc:
++            from plugins.google_meet.wake_chat import WakeChatError
++
++            error = str(exc) if isinstance(exc, WakeChatError) else f"Profile model request failed ({type(exc).__name__})."
++            self._results.put(("", error))
+diff --git a/plugins/google_meet/wake_chat.py b/plugins/google_meet/wake_chat.py
+new file mode 100644
+index 0000000..962d851
+--- /dev/null
++++ b/plugins/google_meet/wake_chat.py
+@@ -0,0 +1,228 @@
++"""Route an explicitly selected meeting to a read-only FlowMind chat session."""
++
++from __future__ import annotations
++
++import hashlib
++import json
++import os
++import re
++import subprocess
++import uuid
++from pathlib import Path
++
++_SESSION_ID = re.compile(r"(?:local-[a-f0-9]{64}|\d{8}_\d{6}_[a-f0-9]{6,12})")
++_FLOWMIND_TOOLS = {"list_projects", "list_tickets", "count_tickets", "get_ticket"}
++
++
++class WakeChatError(RuntimeError):
++    """A wake-chat error safe to expose in Meet status."""
++
++
++def _meeting_chat_path(url: str) -> Path | None:
++    from hermes_constants import get_hermes_home
++    from plugins.google_meet.meet_bot import MEET_URL_RE
++
++    match = MEET_URL_RE.fullmatch(url.strip())
++    code = match.group(1) if match else ""
++    if not code or code == "new" or "/" in code:
++        return None
++    return Path(get_hermes_home()) / "workspace" / "meetings" / code / "wake-chat.json"
++
++
++def load_meeting_chat(url: str) -> str:
++    path = _meeting_chat_path(url)
++    if path is None:
++        raise ValueError("--resume-wake-chat needs a Meet link containing a meeting code")
++    try:
++        value = json.loads(path.read_text(encoding="utf-8"))
++    except FileNotFoundError as exc:
++        raise ValueError("No chat saved for this Meet code. Join once with --wake-session SESSION_ID.") from exc
++    except (OSError, ValueError) as exc:
++        raise ValueError("Could not read the chat saved for this Meet code.") from exc
++    session_id = value.get("session_id") if isinstance(value, dict) else None
++    if not isinstance(session_id, str) or not _SESSION_ID.fullmatch(session_id):
++        raise ValueError("The saved chat ID is invalid. Join with --wake-session SESSION_ID to replace it.")
++    return session_id
++
++
++def remember_meeting_chat(url: str, session_id: str) -> None:
++    from utils import atomic_json_write
++
++    path = _meeting_chat_path(url)
++    if path is not None:
++        path.parent.mkdir(parents=True, exist_ok=True)
++        atomic_json_write(path, {"session_id": session_id}, mode=0o600)
++
++
++def validate_wake_chat(session_id: str) -> None:
++    if not _SESSION_ID.fullmatch(session_id):
++        raise ValueError("--wake-session requires the ID of a dedicated Hermes chat")
++    _validate_flowmind()
++
++
++def _validate_flowmind() -> None:
++    from hermes_cli.config_effective import load_user_config_effective
++    from hermes_constants import get_hermes_home
++
++    config = load_user_config_effective(Path(get_hermes_home()) / "config.yaml")
++    servers = config.get("mcp_servers")
++    server = servers.get("flowmind") if isinstance(servers, dict) else None
++    if not isinstance(server, dict) or "mcp-flowmind" in servers:
++        raise ValueError("Enable the existing FlowMind MCP server named flowmind in this profile.")
++    context = config.get("context") or {}
++    if str(context.get("engine") or "compressor").strip().lower() != "compressor":
++        raise ValueError("Wake chat requires the default context engine to keep tool access restricted.")
++    tools = server.get("tools")
++    include = tools.get("include") if isinstance(tools, dict) else None
++    url = server.get("url")
++    if (not isinstance(url, str) or url.rstrip("/") != "https://build.soar.inc/api/agent/mcp"
++            or server.get("enabled") is False or server.get("disabled") is True
++            or not isinstance(include, list) or not include
++            or any(not isinstance(tool, str) or tool not in _FLOWMIND_TOOLS for tool in include)
++            or tools.get("resources") is not False or tools.get("prompts") is not False):
++        raise ValueError("Configure enabled flowmind with an explicit read-only tool list and disable resources and prompts.")
++
++
++def answer_in_chat(session_id: str, question: str) -> str:
++    from hermes_constants import get_hermes_home
++
++    try:
++        validate_wake_chat(session_id)
++    except ValueError as exc:
++        raise WakeChatError(str(exc)) from exc
++    if question.lstrip().startswith("/"):
++        raise WakeChatError("A spoken question cannot run a Hermes slash command.")
++
++    launcher = Path.home() / ".local" / "bin" / "hermes"
++    env = {**os.environ, "HERMES_HOME": str(get_hermes_home())}
++    env.pop("HERMES_MEET_REALTIME_KEY", None)
++    try:
++        # The gateway validates the repeated flags against the session's original launch
++        # policy. A normal chat with a broader toolset therefore cannot be used here.
++        result = subprocess.run(
++            [str(launcher), "chat", "--resume", session_id, "--ignore-rules",
++             "--toolsets", "mcp-flowmind", "--format", "stream-json", "--query-file", "-"],
++            input=question, capture_output=True, text=True, timeout=75, env=env,
++        )
++    except subprocess.TimeoutExpired as exc:
++        raise WakeChatError("The Hermes chat took too long. Check its history before repeating the question.") from exc
++    except OSError as exc:
++        raise WakeChatError("Could not start the Hermes chat client.") from exc
++
++    if result.returncode:
++        raise WakeChatError("Hermes chat failed. Check the dedicated session ID, launch flags, and FlowMind connection.")
++    for line in reversed(result.stdout.splitlines()):
++        try:
++            event = json.loads(line)
++        except ValueError:
++            continue
++        if isinstance(event, dict) and event.get("type") == "result":
++            reply = event.get("text")
++            if not event.get("exit_code") and isinstance(reply, str) and reply.strip():
++                return " ".join(reply.split())[:650]
++            break
++    raise WakeChatError("Hermes chat returned no reply.")
++
++
++def _calendar_title(raw_title, suffix=""):
++    from hermes_state import SessionDB
++
++    name, separator, date = raw_title.rpartition(" · ")
++    tail = f"{separator}{date}{suffix}" if separator else suffix
++    budget = SessionDB.MAX_TITLE_LENGTH - len(tail)
++    name = name if separator else raw_title
++    if len(name) > budget:
++        name = name[:budget - 1].rstrip() + "…"
++    return SessionDB.sanitize_title(name + tail)
++
++
++async def _name_calendar_chat(client, snapshot, raw_title, event_key):
++    session_id = snapshot["stored_session_id"]
++    for suffix in ("", f" · {event_key[:8]}"):
++        title = _calendar_title(raw_title, suffix)
++        existing = await client.rpc("session.list", title=title, limit=1)
++        sessions = existing.get("sessions", [])
++        if sessions:
++            if sessions[0].get("session_id") == session_id:
++                return
++            continue
++        await client.rpc(
++            "session.mutate", session_id=session_id, request_id=uuid.uuid4().hex,
++            expected_revision=snapshot["revision"], operation="rename", payload={"title": title},
++        )
++        return
++    raise WakeChatError("Calendar chat title is already in use.")
++
++
++async def calendar_chat_session(event_key: str, raw_title: str | None = None, generation: int = 0
++                                ) -> tuple[str, str | None, int]:
++    from argparse import Namespace
++    from hermes_cli.gateway_chat import check_resume_policy
++    from hermes_cli.gateway_client import GatewayClientError, GatewayRPCError, connect_gateway
++
++    if not re.fullmatch(r"[a-f0-9]{64}", event_key):
++        raise ValueError("Invalid Calendar event key.")
++    if generation < 0:
++        raise ValueError("Invalid Calendar chat generation.")
++    _validate_flowmind()
++    async with connect_gateway() as client:
++        for candidate in range(generation, generation + 8):
++            request_id = event_key
++            if candidate:
++                request_id = hashlib.sha256(f"{event_key}:replacement:{candidate}".encode()).hexdigest()
++            try:
++                snapshot = await client.rpc(
++                    "session.create",
++                    request_id=request_id[:32],
++                    source="cli",
++                    ignore_rules=True,
++                    toolsets=["mcp-flowmind"],
++                )
++                break
++            except GatewayRPCError as exc:
++                # A deleted session keeps its original request ID retired.
++                if str(exc) != "not_found":
++                    raise
++        else:
++            raise WakeChatError("Could not find a reusable Calendar chat after deleted sessions.")
++        # The stable request resolves a replacement even if the watcher stopped before saving it.
++        check_resume_policy(Namespace(ignore_rules=True, toolsets="mcp-flowmind"), snapshot)
++        session_id = snapshot.get("stored_session_id")
++        if not isinstance(session_id, str) or not _SESSION_ID.fullmatch(session_id):
++            raise WakeChatError("Hermes did not return a usable Calendar chat session ID.")
++        try:
++            await _name_calendar_chat(
++                client, snapshot, raw_title or f"Hey Horizon Calendar {event_key[:24]}", event_key,
++            )
++        except (GatewayClientError, WakeChatError, ValueError):
++            return session_id, "Could not update the Calendar chat title. The existing chat will still be used.", candidate
++    return session_id, None, candidate
++
++
++def main() -> int:
++    import argparse
++    import asyncio
++    import sys
++
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--calendar-event-key", required=True)
++    parser.add_argument("--title-from-stdin", action="store_true")
++    parser.add_argument("--calendar-chat-generation", type=int, default=0)
++    args = parser.parse_args()
++    raw_title = sys.stdin.read(1024) if args.title_from_stdin else None
++    try:
++        session_id, title_warning, generation = asyncio.run(
++            calendar_chat_session(args.calendar_event_key, raw_title, args.calendar_chat_generation)
++        )
++    except (ValueError, WakeChatError) as exc:
++        print(json.dumps({"ok": False, "error": str(exc)}))
++        return 1
++    except Exception:
++        print(json.dumps({"ok": False, "error": "Could not create or resume the Bot's Calendar chat."}))
++        return 1
++    print(json.dumps({"ok": True, "session_id": session_id, "title_warning": title_warning, "generation": generation}))
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())

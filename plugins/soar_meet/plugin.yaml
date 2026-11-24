@@ -1,0 +1,6 @@
+name: soar_meet
+version: 0.1.1
+description: Join an active Soar Meet call as a signed-in browser participant and optionally answer Hey Dev.
+kind: standalone
+platforms:
+  - linux
