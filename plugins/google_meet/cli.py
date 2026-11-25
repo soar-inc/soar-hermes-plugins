@@ -263,14 +263,14 @@ def _cmd_join(url: str, *, guest_name: str, duration: Optional[str], headed: boo
     if wake_session is not None or resume_wake_chat:
         if not wake:
             return _print_result({"ok": False, "error": "Wake chat options require --wake"})
-        from plugins.google_meet.wake_chat import load_meeting_chat, remember_meeting_chat, validate_wake_chat
+        from plugins.meeting_wake_chat import validate_wake_chat
 
         try:
             if resume_wake_chat:
-                wake_session = load_meeting_chat(url)
+                wake_session = pm.load_meeting_chat(url)
             validate_wake_chat(wake_session)
             if not resume_wake_chat:
-                remember_meeting_chat(url, wake_session)
+                pm.remember_meeting_chat(url, wake_session)
         except OSError:
             return _print_result({"ok": False, "error": "Could not save the wake chat for this meeting."})
         except ValueError as exc:

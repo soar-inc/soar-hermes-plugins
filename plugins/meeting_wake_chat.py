@@ -1,4 +1,4 @@
-"""Route an explicitly selected meeting to a read-only FlowMind chat session."""
+"""Route an explicitly selected meeting to a dedicated FlowMind chat session."""
 
 from __future__ import annotations
 
@@ -18,44 +18,12 @@ class WakeChatError(RuntimeError):
     """A wake-chat error safe to expose in Meet status."""
 
 
-def _meeting_chat_path(url: str) -> Path | None:
-    from hermes_constants import get_hermes_home
-    from plugins.google_meet.meet_bot import MEET_URL_RE
-
-    match = MEET_URL_RE.fullmatch(url.strip())
-    code = match.group(1) if match else ""
-    if not code or code == "new" or "/" in code:
-        return None
-    return Path(get_hermes_home()) / "workspace" / "meetings" / code / "wake-chat.json"
-
-
-def load_meeting_chat(url: str) -> str:
-    path = _meeting_chat_path(url)
-    if path is None:
-        raise ValueError("--resume-wake-chat needs a Meet link containing a meeting code")
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError as exc:
-        raise ValueError("No chat saved for this Meet code. Join once with --wake-session SESSION_ID.") from exc
-    except (OSError, ValueError) as exc:
-        raise ValueError("Could not read the chat saved for this Meet code.") from exc
-    session_id = value.get("session_id") if isinstance(value, dict) else None
-    if not isinstance(session_id, str) or not _SESSION_ID.fullmatch(session_id):
-        raise ValueError("The saved chat ID is invalid. Join with --wake-session SESSION_ID to replace it.")
-    return session_id
-
-
-def remember_meeting_chat(url: str, session_id: str) -> None:
-    from utils import atomic_json_write
-
-    path = _meeting_chat_path(url)
-    if path is not None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        atomic_json_write(path, {"session_id": session_id}, mode=0o600)
+def is_wake_chat_session_id(value: object) -> bool:
+    return isinstance(value, str) and _SESSION_ID.fullmatch(value) is not None
 
 
 def validate_wake_chat(session_id: str) -> None:
-    if not _SESSION_ID.fullmatch(session_id):
+    if not is_wake_chat_session_id(session_id):
         raise ValueError("--wake-session requires the ID of a dedicated Hermes chat")
     _validate_flowmind()
 
@@ -74,13 +42,24 @@ def _validate_flowmind() -> None:
         raise ValueError("Wake chat requires the default context engine to keep tool access restricted.")
     tools = server.get("tools")
     include = tools.get("include") if isinstance(tools, dict) else None
+    # A single wildcard explicitly opts the profile into all native FlowMind tools.
+    valid_selection = (
+        include == ["*"]
+        or (
+            isinstance(include, list)
+            and bool(include)
+            and all(isinstance(tool, str) and tool in _FLOWMIND_TOOLS for tool in include)
+        )
+    )
     url = server.get("url")
     if (not isinstance(url, str) or url.rstrip("/") != "https://build.soar.inc/api/agent/mcp"
             or server.get("enabled") is False or server.get("disabled") is True
-            or not isinstance(include, list) or not include
-            or any(not isinstance(tool, str) or tool not in _FLOWMIND_TOOLS for tool in include)
+            or not valid_selection
             or tools.get("resources") is not False or tools.get("prompts") is not False):
-        raise ValueError("Configure enabled flowmind with an explicit read-only tool list and disable resources and prompts.")
+        raise ValueError(
+            'Configure enabled flowmind with an explicit read-only tool list or include: ["*"] '
+            "for full meeting access, and disable resources and prompts."
+        )
 
 
 def answer_in_chat(session_id: str, question: str) -> str:
@@ -188,7 +167,7 @@ async def calendar_chat_session(event_key: str, raw_title: str | None = None, ge
         # The stable request resolves a replacement even if the watcher stopped before saving it.
         check_resume_policy(Namespace(ignore_rules=True, toolsets="mcp-flowmind"), snapshot)
         session_id = snapshot.get("stored_session_id")
-        if not isinstance(session_id, str) or not _SESSION_ID.fullmatch(session_id):
+        if not is_wake_chat_session_id(session_id):
             raise WakeChatError("Hermes did not return a usable Calendar chat session ID.")
         try:
             await _name_calendar_chat(

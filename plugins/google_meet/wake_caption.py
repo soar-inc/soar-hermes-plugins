@@ -142,14 +142,14 @@ class CaptionWake:
     def _answer(self, question: str) -> None:
         try:
             if self._wake_session:
-                from plugins.google_meet.wake_chat import answer_in_chat
+                from plugins.meeting_wake_chat import answer_in_chat
 
                 answer = answer_in_chat(self._wake_session, question)
             else:
                 answer = _answer(question)
             self._results.put((answer, None if answer else "The profile model returned an empty answer."))
         except Exception as exc:
-            from plugins.google_meet.wake_chat import WakeChatError
+            from plugins.meeting_wake_chat import WakeChatError
 
             error = str(exc) if isinstance(exc, WakeChatError) else f"Profile model request failed ({type(exc).__name__})."
             self._results.put(("", error))

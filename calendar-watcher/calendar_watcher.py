@@ -160,7 +160,7 @@ def flowmind_chat_session(event_id, title, db):
     generation = row[0] if row else 0
     profile = Path.home() / ".hermes" / "profiles" / "long-horizon"
     result = subprocess.run(
-        [CLI[0], "--run-module", "plugins.google_meet.wake_chat", "--calendar-event-key", event_key,
+        [CLI[0], "--run-module", "plugins.meeting_wake_chat", "--calendar-event-key", event_key,
          "--title-from-stdin", "--calendar-chat-generation", str(generation)],
         input=title, env={**os.environ, "HERMES_HOME": str(profile)}, capture_output=True, text=True,
         timeout=45, check=False,
