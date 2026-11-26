@@ -1,111 +1,117 @@
-"""Renew Dev's read-only FlowMind presentation session in the Meet browser."""
+"""Use the first account signed into FlowMind in the Meet Chrome profile."""
 
 from __future__ import annotations
 
-import base64
-import json
-import os
-import stat
+import hashlib
+import hmac
+import re
 import time
+from contextlib import suppress
 from pathlib import Path
-from urllib.parse import urlencode, urlsplit
-from urllib.request import HTTPRedirectHandler, Request, build_opener
+from tempfile import NamedTemporaryFile
+from urllib.parse import urlsplit
 
-_ORIGIN = "https://build.soar.inc"
-_SESSION_URL = f"{_ORIGIN}/api/auth/presentation-session"
-_VIEW_URL = f"{_ORIGIN}/api/auth/presentation-view"
-_TOKEN_URL = "https://soar-id-277347409468.me-central2.run.app/token"
-_CLIENT_ID = "flowmind-dev-presenter"
+FLOWMIND_ORIGIN = "https://build.soar.inc"
+_SESSION_URL = f"{FLOWMIND_ORIGIN}/api/auth/presentation-session"
+_LOGIN_URL = f"{FLOWMIND_ORIGIN}/login?callbackUrl=%2Fdashboard"
+_BINDING = ".hermes-flowmind-account"
+_CHECK_INTERVAL = 60
 
 
 class FlowMindSessionError(RuntimeError):
-    """Safe to report in the meeting without including any credentials."""
+    """An actionable sign-in error that is safe to read aloud."""
 
 
-class _NoRedirect(HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None
+def is_flowmind_url(url: str) -> bool:
+    try:
+        parsed = urlsplit(url)
+        return (parsed.scheme, parsed.netloc) == ("https", "build.soar.inc")
+    except (TypeError, ValueError):
+        return False
 
 
-def _read_secret(path: Path) -> str:
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-    with os.fdopen(fd, "rb") as secret_file:
-        info = os.fstat(secret_file.fileno())
-        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
-            raise ValueError("credential permissions")
-        secret = secret_file.read(4097).decode("ascii").strip()
-    if not secret or len(secret) > 4096 or any(not 33 <= ord(char) <= 126 for char in secret):
-        raise ValueError("credential format")
-    return secret
+def _account(email: str) -> str:
+    return hashlib.sha256(email.strip().lower().encode("utf-8")).hexdigest()
 
 
-def _mint_token(path: Path) -> str:
-    credentials = base64.b64encode(f"{_CLIENT_ID}:{_read_secret(path)}".encode("ascii")).decode("ascii")
-    request = Request(
-        _TOKEN_URL,
-        data=urlencode({"grant_type": "client_credentials"}).encode("ascii"),
-        headers={"Authorization": f"Basic {credentials}", "Content-Type": "application/x-www-form-urlencoded"},
-    )
-    with build_opener(_NoRedirect()).open(request, timeout=5) as response:
-        payload = json.loads(response.read(16_385))
-    token = payload.get("access_token") if isinstance(payload, dict) else None
-    if not isinstance(token, str) or not token.isascii() or not 1 <= len(token) <= 3500:
-        raise ValueError("token format")
-    return token
+def _signed_in_account(context) -> str | None:
+    try:
+        response = context.request.get(_SESSION_URL, max_redirects=0, timeout=6_000)
+        try:
+            if response.status == 401:
+                return None
+            if response.status != 200:
+                raise ValueError("sign-in check failed")
+            email = response.json()["email"]
+            if not isinstance(email, str) or not email.strip():
+                raise ValueError("account missing")
+            return _account(email)
+        finally:
+            response.dispose()
+    except Exception:
+        raise FlowMindSessionError("Dev couldn't verify its FlowMind sign-in.") from None
+
+
+def bind_flowmind_account(context, profile: Path) -> None:
+    account = _signed_in_account(context)
+    if account is None:
+        raise FlowMindSessionError("Finish signing in to FlowMind before saving this account.")
+    path = None
+    try:
+        with NamedTemporaryFile(dir=profile, mode="w", encoding="ascii", delete=False) as file:
+            path = Path(file.name)
+            file.write(f"{account}\n")
+        path.replace(profile / _BINDING)
+    finally:
+        if path is not None:
+            path.unlink(missing_ok=True)
 
 
 class FlowMindSession:
-    def __init__(self, context, secret_path: Path):
+    def __init__(self, context, profile: Path):
         self.context = context
-        self.secret_path = secret_path
-        self.expires_at = 0
-        self.renew_after = 0
+        self.binding = profile / _BINDING
+        self.next_check = 0.0
 
     @classmethod
     def for_url(cls, context, url: str) -> FlowMindSession | None:
-        parsed = urlsplit(url)
-        if (parsed.scheme, parsed.netloc, parsed.path.rstrip("/")) != (
-            "https", "build.soar.inc", "/ticket-management/initiatives/dashboard"
-        ):
+        if not is_flowmind_url(url):
             return None
 
-        from hermes_constants import get_hermes_home
+        from plugins.google_meet.chrome_profile import chrome_profile_path
 
-        secret_path = Path(get_hermes_home()) / "workspace" / "meetings" / "flowmind-client-secret"
-        return cls(context, secret_path) if os.path.lexists(secret_path) else None
+        return cls(context, chrome_profile_path())
 
-    @property
-    def view_url(self) -> str:
-        return _VIEW_URL
+    def _continue_sign_in(self) -> None:
+        # Let FlowMind's existing login page continue via SOAR if this Chrome
+        # profile still has SSO. Keep the login tab separate from the share.
+        page = self.context.new_page()
+        try:
+            page.on("popup", lambda popup: popup.close())
+            page.goto(_LOGIN_URL, wait_until="domcontentloaded", timeout=10_000)
+        except Exception:
+            # A navigation can time out after the new cookies were already set.
+            # The caller checks the session itself before sharing anything.
+            pass
+        finally:
+            with suppress(Exception):
+                page.close()
 
     def ensure(self, *, force: bool = False) -> None:
-        if not force and time.time() < self.renew_after:
+        if not force and time.monotonic() < self.next_check:
             return
         try:
-            token = _mint_token(self.secret_path)
-            response = self.context.request.post(
-                _SESSION_URL, headers={"Authorization": f"Bearer {token}"},
-                max_redirects=0, timeout=5_000,
-            )
-            try:
-                if response.status != 200:
-                    raise ValueError("session refused")
-                expires_at = response.json()["expires_at"]
-                now = time.time()
-                if type(expires_at) is not int or not now + 5 < expires_at <= now + 300:
-                    raise ValueError("invalid expiry")
-            finally:
-                response.dispose()
-        except Exception:
-            raise FlowMindSessionError("Dev couldn't renew its read-only FlowMind session.") from None
-        self.expires_at = expires_at
-        self.renew_after = expires_at - min(60, (expires_at - now) / 2)
-
-    def maintain(self) -> None:
-        try:
-            self.ensure()
-        except FlowMindSessionError:
-            now = time.time()
-            if now >= self.expires_at:
-                raise
-            self.renew_after = min(self.expires_at, now + 10)
+            expected = self.binding.read_text(encoding="ascii").strip()
+        except (OSError, UnicodeError):
+            expected = ""
+        if not re.fullmatch(r"[0-9a-f]{64}", expected):
+            raise FlowMindSessionError("Set up Dev's FlowMind account on Bot Screen with meet auth --flowmind.")
+        account = _signed_in_account(self.context)
+        if account is None:
+            self._continue_sign_in()
+            account = _signed_in_account(self.context)
+        if account is None:
+            raise FlowMindSessionError("FlowMind needs the selected account to sign in again on Bot Screen.")
+        if not hmac.compare_digest(account, expected):
+            raise FlowMindSessionError("FlowMind is signed in as a different account. Check Dev's login on Bot Screen.")
+        self.next_check = time.monotonic() + _CHECK_INTERVAL

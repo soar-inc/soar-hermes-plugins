@@ -15,9 +15,13 @@ from pathlib import Path
 from queue import Empty, SimpleQueue
 from urllib.parse import urljoin, urlsplit
 
-from plugins.google_meet.flowmind_session import FlowMindSession, FlowMindSessionError
-
-_FLOWMIND = "https://build.soar.inc"
+from plugins.google_meet.flowmind_session import (
+    FLOWMIND_ORIGIN as _FLOWMIND,
+    FlowMindSession,
+    FlowMindSessionError,
+    bind_flowmind_account,
+    is_flowmind_url as _is_flowmind_origin,
+)
 _DASHBOARD = f"{_FLOWMIND}/dashboard"
 _PRESENT = re.compile(r"^(?:present now|start presenting|share (?:your )?screen)(?:[ (].*\))?$", re.I)
 _TAB = re.compile(r"^(?:a tab|chrome tab|chromium tab)$", re.I)
@@ -98,14 +102,12 @@ def authorize_dashboard() -> int:
             try:
                 seed_legacy_flowmind(context, profile)
                 page = context.pages[0]
-                page.goto(_DASHBOARD, wait_until="domcontentloaded", timeout=30_000)
-                input("Sign in to FlowMind as Dev in Chrome. Press Enter when the dashboard is visible. ")
+                page.goto(f"{_FLOWMIND}/login?via=soar-id", wait_until="domcontentloaded", timeout=30_000)
+                input("Sign in to the FlowMind account Dev should use. Choose Continue with SOAR if available. "
+                      "Press Enter when the dashboard is visible. ")
                 if not _is_dashboard(page.url):
                     raise PresentationError("FlowMind sign-in was not confirmed.")
-                response = context.request.get(f"{_FLOWMIND}/api/auth/session", timeout=10_000)
-                session = response.json() if response.ok else {}
-                if not ((session or {}).get("user") or {}).get("email"):
-                    raise PresentationError("FlowMind sign-in was not confirmed.")
+                bind_flowmind_account(context, profile)
             finally:
                 context.close()
     except (PresentationError, RuntimeError) as exc:
@@ -116,14 +118,6 @@ def authorize_dashboard() -> int:
         return 1
     print("Saved the FlowMind session in the persistent Meet Chrome profile.")
     return 0
-
-
-def _is_flowmind_origin(url: str) -> bool:
-    try:
-        parsed = urlsplit(url)
-        return parsed.scheme == "https" and parsed.netloc == "build.soar.inc"
-    except (TypeError, ValueError):
-        return False
 
 
 def _presentation_url(url: str) -> str:
@@ -343,7 +337,6 @@ class Presentation:
                 flowmind.ensure()
             except FlowMindSessionError as exc:
                 raise PresentationSignInRequired(str(exc)) from exc
-            url = flowmind.view_url
 
         tab = self.meet.context.new_page()
         try:
@@ -361,9 +354,7 @@ class Presentation:
                 error = navigation_errors[-1] if navigation_errors else PresentationError("The requested page couldn't load.")
                 raise error from exc
             final_url = _presentation_url(tab.url)
-            if flowmind and final_url != flowmind.view_url:
-                raise PresentationError("FlowMind redirected away from its read-only dashboard.")
-            if (not flowmind and _sign_in_path(final_url)) or (response is not None and response.status == 401):
+            if _sign_in_path(final_url) or (response is not None and response.status == 401):
                 raise PresentationSignInRequired("Dev needs a browser sign-in to present this page.")
             if response is None or not response.ok:
                 raise PresentationError("The requested page didn't load successfully.")
@@ -428,7 +419,7 @@ class Presentation:
             return
         if self.flowmind_session is not None:
             try:
-                self.flowmind_session.maintain()
+                self.flowmind_session.ensure()
             except FlowMindSessionError as exc:
                 self._failure(str(exc), phase="sign-in-required")
                 return

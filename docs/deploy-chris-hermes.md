@@ -110,28 +110,22 @@ Look for `inCall`, `realtimeReady` and `wakeEnabled`. Ask a read-only question s
 
 For a rollback, pause the watcher job and stop the bot, then restore the previous plugin, shared module, and watcher code from the deployment backup or the previous reviewed release. Preserve the profile's credential and meeting-data directories.
 
-## Dev's read-only FlowMind presentation session
+## FlowMind sign-in for Google Meet presentations
 
-This opt-in uses the same Google Meet browser while Dev presents. It supports the FlowMind
-initiatives dashboard at `https://build.soar.inc/ticket-management/initiatives/dashboard`.
-The page Dev shares is a read-only view of the initiative keys approved by the FlowMind owner.
+Deploy the FlowMind presentation session check before installing these plugin changes.
+On Bot Screen, register the FlowMind account Dev should use:
 
-1. Have the Soar ID owner roll out the `flowmind-presentation` registration and grant
-   `presentation_reader` to `svc:flowmind-dev-presenter`.
-2. Deploy the paired FlowMind changes. Set `FLOWMIND_PRESENTATION_READER_EMAIL` to the approved
-   ticket-service reader and `FLOWMIND_PRESENTATION_INITIATIVES` to the comma-separated approved
-   initiative keys on the FlowMind web deployment. Both settings are required.
-3. Deploy the Google Meet plugin. Have an authorized operator provision the Soar ID client
-   secret as a regular file owned by `hermes` with mode `0600` at
-   `/home/hermes/.hermes/profiles/long-horizon/workspace/meetings/flowmind-client-secret`.
-   The file contains only the secret. Use the approved secret store and avoid passing
-   the value through shell arguments. Replace the file atomically when rotating it.
-4. In a Google Meet joined with `--mode realtime --wake --voice-share`, say
-   **“Hey Dev, show everyone the FlowMind initiatives dashboard.”** Check that the presentation
-   shows the approved initiatives and refresh the tab after a token renewal. The service cookie
-   is scoped to the presentation endpoint and cannot authorize the normal FlowMind app or API.
+```bash
+hermes -p long-horizon meet auth --flowmind
+```
 
-Dev renews the short-lived session before expiry while sharing the dashboard. It retries a
-temporary error while the previous session is valid and ends the share if it can no longer
-renew. To disable this opt-in on the profile, stop the presentation and remove the secret file
-through your normal secret-management workflow.
+Use **Continue with SOAR** if available. The operator signs in and confirms the account
+in the persistent Meet Chrome profile. Dev uses that account's existing permissions.
+
+Join Google Meet with `--mode realtime --wake --voice-share` and ask Dev to share a FlowMind
+dashboard, project, board or ticket. Dev presents the requested page at its normal FlowMind URL
+from the same call. The plugin checks the account before sharing and periodically during a share.
+FlowMind's normal session refresh runs during these checks. If the app session has ended, Dev
+tries FlowMind's usual browser sign-in once in a separate tab so an existing SOAR session can
+renew it. If the account changes or sign-in needs a person, Dev stops and reports it. To change
+the account, sign in with the intended account and rerun the setup command.
