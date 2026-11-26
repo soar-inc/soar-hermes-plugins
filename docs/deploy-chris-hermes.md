@@ -27,12 +27,15 @@ for plugin in google_meet soar_meet; do
 done
 ```
 
-Back up the existing plugin directories and watcher files. Then install both source directories and the two calendar files:
+Back up the existing plugin directories, shared module if present, and watcher files. Install both plugin directories, the shared wake-chat module and the two calendar files.
 
 ```bash
 for plugin in google_meet soar_meet; do
   cp -R "$integration_dir/plugins/$plugin" "$hermes_repo/plugins/"
 done
+
+install -m 600 "$integration_dir/plugins/meeting_wake_chat.py" "$hermes_repo/plugins/meeting_wake_chat.py"
+rm -f "$hermes_repo/plugins/google_meet/wake_chat.py"
 
 install -d -m 700 "$profile_dir/calendar-watcher" "$profile_dir/scripts"
 install -m 600 "$integration_dir/calendar-watcher/calendar_watcher.py"   "$profile_dir/calendar-watcher/calendar_watcher.py"
@@ -56,7 +59,7 @@ command -v paplay
 
 On this VM the PulseAudio socket is provided by `hermes-meet-audio.service`. An administrator can check it with `systemctl status hermes-meet-audio.service`. Use the VM's configured package management if Chromium prerequisites or PulseAudio tools are missing.
 
-Configure the Realtime credential as `HERMES_MEET_REALTIME_KEY` in the profile's private `.env` through the approved secret process. The plugin can also use `OPENAI_API_KEY`. For event chats, the profile needs a working model provider, the default Compressor context engine, and an enabled MCP server named `flowmind` with the approved endpoint. The shared wake-chat code accepts only `list_projects`, `list_tickets`, `count_tickets` and `get_ticket`, with MCP resources and prompts disabled. Merge these settings into the existing profile configuration.
+Configure the Realtime credential as `HERMES_MEET_REALTIME_KEY` in the profile's private `.env` through the approved secret process. The plugin can also use `OPENAI_API_KEY`. For event chats, the profile needs a working model provider, the default Compressor context engine, and an enabled MCP server named `flowmind` with the approved endpoint. The shared wake-chat code accepts an explicit read-only list drawn from `list_projects`, `list_tickets`, `count_tickets` and `get_ticket`, or `include: ["*"]` for all tools the server advertises to the profile. Set `resources: false` and `prompts: false` under `mcp_servers.flowmind.tools` for either option. The wildcard includes write tools available to the FlowMind credential. Participants can address Dev with a wake phrase during a call.
 
 ## 3. Authorize the three accounts or sessions
 
@@ -105,4 +108,4 @@ Use a test event on the watched calendar. Attach Google conferencing for a Googl
 
 Look for `inCall`, `realtimeReady` and `wakeEnabled`. Ask a read-only question such as “Hey Horizon, list my FlowMind projects.” Check that the reply is audible and that the Hermes chat in **Sessions** has the event's title and date. Job output is under `$profile_dir/cron/output/<job-id>/`. Use `meet stop` or `soar-meet stop` under the same profile to end a test bot run.
 
-For a rollback, pause the watcher job and stop the bot, then restore the previous plugin and watcher code from the deployment backup or the previous reviewed release. Preserve the profile's credential and meeting-data directories.
+For a rollback, pause the watcher job and stop the bot, then restore the previous plugin, shared module, and watcher code from the deployment backup or the previous reviewed release. Preserve the profile's credential and meeting-data directories.

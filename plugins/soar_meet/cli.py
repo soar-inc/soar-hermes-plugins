@@ -28,7 +28,7 @@ def register_cli(parser):
     join.add_argument("--mode", choices=("transcribe", "realtime"), default="transcribe")
     join.add_argument("--wake", action="store_true", help='Answer questions addressed to "Hey Dev" or "Hey Horizon".')
     join.add_argument("--headed", action="store_true")
-    join.add_argument("--wake-session", help="Reuse a dedicated Hermes chat with read-only FlowMind tools.")
+    join.add_argument("--wake-session", help="Reuse a dedicated Hermes chat with the profile's configured FlowMind tools.")
     join.add_argument("--until", type=int, metavar="UNIX_TIMESTAMP",
                       help="Leave the scheduled call by this time.")
     join.add_argument("--start-call", action="store_true",
@@ -123,7 +123,7 @@ def _join(args):
     if args.wake_session:
         if not args.wake:
             raise ValueError("--wake-session requires --wake.")
-        from plugins.google_meet.wake_chat import validate_wake_chat
+        from plugins.meeting_wake_chat import validate_wake_chat
 
         validate_wake_chat(args.wake_session)
     if args.until is not None and args.until <= time.time():

@@ -21,12 +21,46 @@ from typing import Any, Dict, Optional
 
 from hermes_constants import get_hermes_home
 from plugins.google_meet._jsonfile import say_queue_lock
+from plugins.meeting_wake_chat import is_wake_chat_session_id
 
 from utils import atomic_json_write
 
 
 def _root() -> Path:
     return Path(get_hermes_home()) / "workspace" / "meetings"
+
+
+def _meeting_chat_path(url: str) -> Path | None:
+    from plugins.google_meet.meet_bot import MEET_URL_RE
+
+    match = MEET_URL_RE.fullmatch(url.strip())
+    code = match.group(1) if match else ""
+    if not code or code == "new" or "/" in code:
+        return None
+    return _root() / code / "wake-chat.json"
+
+
+def load_meeting_chat(url: str) -> str:
+    path = _meeting_chat_path(url)
+    if path is None:
+        raise ValueError("--resume-wake-chat needs a Meet link containing a meeting code")
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise ValueError("No chat saved for this Meet code. Join once with --wake-session SESSION_ID.") from exc
+    except (OSError, ValueError) as exc:
+        raise ValueError("Could not read the chat saved for this Meet code.") from exc
+    session_id = value.get("session_id") if isinstance(value, dict) else None
+    if not is_wake_chat_session_id(session_id):
+        raise ValueError("The saved chat ID is invalid. Join with --wake-session SESSION_ID to replace it.")
+    return session_id
+
+
+def remember_meeting_chat(url: str, session_id: str) -> None:
+    path = _meeting_chat_path(url)
+    if path is not None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_json_write(path, {"session_id": session_id}, mode=0o600)
 
 
 def _active_file() -> Path:

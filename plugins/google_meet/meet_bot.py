@@ -108,8 +108,7 @@ class _BotState:
 # collects {speaker, text}; ``window.__hermesMeetDrain()`` pulls new entries.
 _CAPTION_OBSERVER_JS = r"""
 (() => {
-  if (window.__hermesMeetInstalled) return;
-  window.__hermesMeetInstalled = true;
+  if (typeof window.__hermesMeetDrain === 'function') return;
   window.__hermesMeetQueue = [];
   const rowsSeen = new WeakMap();
   let nextRow = 0;
@@ -170,18 +169,39 @@ _CAPTION_OBSERVER_JS = r"""
 })();
 """
 
+_CAPTION_DRAIN_JS = "window.__hermesMeetDrain && window.__hermesMeetDrain()"
+_CAPTION_CHECK_INTERVAL = 5.0
+_ENABLE_CAPTIONS = re.compile(r"^(?:(?:turn on|show) captions|turn captions on)(?:\s*\([^)]+\))?$", re.I)
+_DISABLE_CAPTIONS = re.compile(r"^(?:(?:turn off|hide) captions|turn captions off)(?:\s*\([^)]+\))?$", re.I)
+
 _LEAVE_CALL_JS = (
     "() => { const b = document.querySelector('button[aria-label*=\"eave call\"]');"
     " if (b) b.click(); }")
 
-# True once past the lobby: leave button, caption region (once our observer is installed)
-# or participant list visible.
+# Require visible controls from the in-call toolbar. The lobby can also
+# contain text or accessible labels mentioning participants.
 _ADMISSION_PROBE_JS = r"""
     (() => {
-      if (document.querySelector('button[aria-label*="eave call" i]')) return true;
-      if (window.__hermesMeetInstalled && document.querySelector(
-          '[role="region"][aria-label*="aption" i], div[jsname="YSxPC"], div[jsname="tgaKEf"]')) return true;
-      return !!document.querySelector('[aria-label*="articipants" i]');
+      const bodyText = document.body?.innerText || '';
+      const visible = (node) => node.getClientRects().length > 0
+        && getComputedStyle(node).visibility === 'visible'
+        && !node.closest('[aria-hidden="true"]');
+      const controls = [...document.querySelectorAll(
+        'button[aria-label], [role="button"][aria-label]'
+      )].filter(visible).map((node) => node.getAttribute('aria-label').trim());
+      const has = (pattern) => controls.some((label) => pattern.test(label));
+      if (/You can['’]t join this video call|You were removed from the meeting|No one responded to your request to join|Your request to join was denied/i.test(bodyText)) {
+        return 'denied';
+      }
+      if (/asking to join|you(?:'|’)ve asked to join|waiting to be admitted|waiting for (?:the )?host to let you in|someone will let you in soon|you(?:'|’)ll join when someone lets you in/i.test(bodyText)
+          || has(/^cancel (?:join )?request$/i)) {
+        return 'lobby';
+      }
+      if (has(/^(?:join now|ask to join)$/i)) return 'pending';
+
+      const leave = has(/^leave call(?:\s*\([^)]+\))?$/i);
+      const inCallControl = has(/^(?:show everyone|(?:turn (?:on|off)|show|hide) captions|turn captions (?:on|off)|present now|chat with everyone)(?:\s*\([^)]+\))?$/i);
+      return leave && inCallControl ? 'admitted' : 'pending';
     })();
     """
 
@@ -206,20 +226,6 @@ _PARTICIPANT_COUNT_JS = r"""
       return counts.size === 1 ? [...counts][0] : null;
     }
     """
-
-
-# English only — what Meet shows when the host denies or removes a guest.
-_DENIED_PROBE_JS = r"""
-    (() => {
-      const text = document.body ? document.body.innerText || '' : '';
-      return /You can't join this video call|You were removed from the meeting|No one responded to your request to join/i.test(text);
-    })();
-    """
-
-
-def _probe(page, js: str) -> bool:
-    """Evaluate a boolean JS probe; conservative — False on any error."""
-    return bool(_quiet(page.evaluate, js))
 
 
 def _visible(locator):
@@ -413,19 +419,30 @@ def _ensure_mic_on(page) -> str:
     return "unknown"
 
 
-def _start_captions(page, state: _BotState) -> None:
-    """Observe captions and turn them on in the admitted bot's own browser."""
+def _ensure_captions(page, state: _BotState, *, allow_shortcut: bool = False) -> None:
+    """Enable an explicitly disabled caption control without toggling an enabled one."""
+    if _visible(page.get_by_role("button", name=_DISABLE_CAPTIONS)):
+        if not state.captioning:
+            state.set(captioning=True)
+        return
+    toggle = _visible(page.get_by_role("button", name=_ENABLE_CAPTIONS))
+    if toggle is not None:
+        if state.captioning:
+            state.set(captioning=False)
+        toggle.click(timeout=3_000)
+    elif allow_shortcut:
+        page.keyboard.press("c")
+    else:
+        return
+    if not state.captions_enabled_attempted:
+        state.set(captions_enabled_attempted=True)
+
+
+def _start_captions(page, state: _BotState, *, allow_shortcut: bool = True) -> None:
+    """Install the observer in the current document and enable its captions."""
     try:
         page.evaluate(_CAPTION_OBSERVER_JS)
-        state.set(captioning=True)
-        if _visible(page.get_by_role("button", name=re.compile(r"(turn off|hide) captions", re.I))):
-            return
-        toggle = _visible(page.get_by_role("button", name=re.compile(r"(turn on|show) captions", re.I)))
-        if toggle is not None:
-            toggle.click(timeout=3_000)
-        else:
-            page.keyboard.press("c")
-        state.set(captions_enabled_attempted=True)
+        _ensure_captions(page, state, allow_shortcut=allow_shortcut)
     except Exception as exc:
         state.set(error=f"caption setup failed: {exc}")
 
@@ -437,6 +454,7 @@ def _drain_loop(page, cfg: _BotConfig, state: _BotState, rt: dict, stop_flag: di
     lobby_deadline = time.time() + cfg.lobby_timeout
     last_admission_check = 0.0
     next_participant_check = 0.0
+    next_caption_check = 0.0
     had_company = False
     alone_since = None
     wake = rt.get("wake")
@@ -447,17 +465,22 @@ def _drain_loop(page, cfg: _BotConfig, state: _BotState, rt: dict, stop_flag: di
             return
         if not state.in_call and (now - last_admission_check) > 3.0:
             last_admission_check = now
-            if _probe(page, _ADMISSION_PROBE_JS):
+            admission = _quiet(page.evaluate, _ADMISSION_PROBE_JS)
+            if admission == "denied":
+                state.set(lobby_waiting=False, error="host denied admission", leave_reason="denied")
+                return
+            if admission == "admitted":
                 state.set(in_call=True, lobby_waiting=False, joined_at=now, mic_state=_ensure_mic_on(page))
                 _start_captions(page, state)
+                next_caption_check = time.monotonic() + _CAPTION_CHECK_INTERVAL
             elif now > lobby_deadline:
                 waited = int(lobby_deadline - state.join_attempted_at) if state.join_attempted_at else 0
-                state.set(error=f"lobby timeout — host never admitted the bot within {waited}s",
+                state.set(lobby_waiting=False,
+                          error=f"lobby timeout — host never admitted the bot within {waited}s",
                           leave_reason="lobby_timeout")
                 return
-            elif _probe(page, _DENIED_PROBE_JS):
-                state.set(error="host denied admission", leave_reason="denied")
-                return
+            elif admission == "lobby" and not state.lobby_waiting:
+                state.set(lobby_waiting=True)
         if state.in_call and time.monotonic() >= next_participant_check:
             participants = _quiet(page.evaluate, _PARTICIPANT_COUNT_JS)
             checked_at = time.monotonic()
@@ -473,10 +496,24 @@ def _drain_loop(page, cfg: _BotConfig, state: _BotState, rt: dict, stop_flag: di
             else:
                 alone_since = None
         try:
-            queued = page.evaluate("window.__hermesMeetDrain && window.__hermesMeetDrain()")
+            queued = page.evaluate(_CAPTION_DRAIN_JS)
+            if state.in_call and time.monotonic() >= next_caption_check:
+                next_caption_check = time.monotonic() + _CAPTION_CHECK_INTERVAL
+                if queued is None:
+                    # A new document has no drain function. Wait for the in-call toolbar
+                    # before reinstalling so a reload into the lobby cannot trigger input.
+                    if state.captioning:
+                        state.set(captioning=False)
+                    if _quiet(page.evaluate, _ADMISSION_PROBE_JS) == "admitted":
+                        _start_captions(page, state, allow_shortcut=False)
+                else:
+                    _ensure_captions(page, state)
             for entry in (e for e in (queued if isinstance(queued, list) else ()) if isinstance(e, dict)):
                 speaker = str(entry.get("speaker", ""))
-                state.record_caption(speaker=speaker, text=str(entry.get("text", "")))
+                text = str(entry.get("text", ""))
+                if state.in_call and text.strip() and not state.captioning:
+                    state.set(captioning=True)
+                state.record_caption(speaker=speaker, text=text)
                 if wake is not None and state.in_call:
                     wake.observe(entry, time.monotonic())
                 # Barge-in: a real human spoke while we may be generating audio.
@@ -487,8 +524,10 @@ def _drain_loop(page, cfg: _BotConfig, state: _BotState, rt: dict, stop_flag: di
             if page.is_closed():  # Meet reloaded or we got booted — exit rather than spin
                 state.set(leave_reason="page_closed")
                 return
-        if wake is not None and state.in_call:
-            wake.poll(state, time.monotonic())
+        if wake is not None and state.in_call and wake.poll(state, time.monotonic()):
+            stop_flag["stop"] = True
+            state.set(leave_reason="voice_requested")
+            return
         if rt["session"] is not None:
             state.set(audio_bytes_out=rt["session"].audio_bytes_out,
                       last_audio_out_at=rt["session"].last_audio_out_at)
@@ -565,7 +604,7 @@ def run_bot() -> int:
             context.close()
             browser.close()
             _teardown_realtime(rt)
-            state.set(in_call=False, captioning=False, exited=True)
+            state.set(in_call=False, lobby_waiting=False, captioning=False, exited=True)
             return 0
     except Exception as e:
         state.set(error=f"unhandled: {e}", exited=True)
