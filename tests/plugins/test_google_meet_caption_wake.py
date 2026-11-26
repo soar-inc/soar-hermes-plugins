@@ -6,7 +6,9 @@ from unittest.mock import Mock, patch
 import pytest
 
 from plugins.google_meet import wake_caption
-from plugins.google_meet.meet_bot import _ADMISSION_PROBE_JS, _BotConfig, _BotState, _drain_loop
+from plugins.google_meet.meet_bot import (
+    _ADMISSION_PROBE_JS, _CAPTION_DRAIN_JS, _CAPTION_OBSERVER_JS, _BotConfig, _BotState, _drain_loop,
+)
 from tests.waiting import wait_until
 
 
@@ -35,7 +37,9 @@ def test_caption_controls_are_used_after_admission(tmp_path):
         if events[-1] == "admitted":
             events.append("observer installed")
             return None
-        stop["stop"] = True
+        if script is _CAPTION_DRAIN_JS:
+            stop["stop"] = True
+            return [{"row": 1, "speaker": "Caller", "text": "Testing captions"}]
         return []
 
     page.evaluate.side_effect = evaluate
@@ -176,3 +180,59 @@ def test_google_meet_voice_leave_uses_existing_teardown(tmp_path):
 
     assert stop["stop"]
     assert state.leave_reason == "voice_requested"
+
+
+def test_google_meet_recovers_disabled_captions_and_reinstalls_listener_after_reload(tmp_path):
+    state = _BotState(tmp_path, "abc-defg-hij", "https://meet.google.com/abc-defg-hij")
+    state.set(in_call=True, captioning=True)
+    page = Mock()
+    wake = Mock()
+    wake.poll.return_value = False
+    stop = {"stop": False}
+    stage = [0]
+    captions_on = [False]
+    installs = []
+
+    def evaluate(script):
+        if script is _CAPTION_DRAIN_JS:
+            if stage[0] in (1, 2):
+                return None
+            if stage[0] == 3:
+                assert state.captioning
+                stop["stop"] = True
+                return [{"row": 1, "speaker": "Caller", "text": "Back after reload"}]
+            return []
+        if script is _ADMISSION_PROBE_JS:
+            assert not state.captioning
+            return "lobby" if stage[0] == 1 else "admitted"
+        if script is _CAPTION_OBSERVER_JS:
+            installs.append(stage[0])
+        return None
+
+    def get_by_role(role, name):
+        button = Mock()
+        label = "Turn captions off" if captions_on[0] else "Turn captions on"
+        button.first.count.return_value = int(bool(name.search(label)))
+        button.first.is_visible.return_value = True
+
+        def enable(**_kwargs):
+            assert not captions_on[0]
+            captions_on[0] = True
+
+        button.first.click.side_effect = enable
+        return button
+
+    page.evaluate.side_effect = evaluate
+    page.get_by_role.side_effect = get_by_role
+    with (
+        patch("plugins.google_meet.meet_bot.time.monotonic", side_effect=lambda: 100 + stage[0] * 6),
+        patch("plugins.google_meet.meet_bot.time.sleep", side_effect=lambda _s: stage.__setitem__(0, stage[0] + 1)),
+    ):
+        _drain_loop(page, _BotConfig(guest_name="Dev Agent", duration_s=0, lobby_timeout=30),
+                    state, {"session": None, "wake": wake}, stop)
+
+    assert captions_on[0] and state.captions_enabled_attempted
+    assert installs == [2]
+    assert state.transcript_lines == 1
+    wake.observe.assert_called_once()
+    page.keyboard.press.assert_not_called()

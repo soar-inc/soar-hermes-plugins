@@ -108,8 +108,7 @@ class _BotState:
 # collects {speaker, text}; ``window.__hermesMeetDrain()`` pulls new entries.
 _CAPTION_OBSERVER_JS = r"""
 (() => {
-  if (window.__hermesMeetInstalled) return;
-  window.__hermesMeetInstalled = true;
+  if (typeof window.__hermesMeetDrain === 'function') return;
   window.__hermesMeetQueue = [];
   const rowsSeen = new WeakMap();
   let nextRow = 0;
@@ -169,6 +168,11 @@ _CAPTION_OBSERVER_JS = r"""
   };
 })();
 """
+
+_CAPTION_DRAIN_JS = "window.__hermesMeetDrain && window.__hermesMeetDrain()"
+_CAPTION_CHECK_INTERVAL = 5.0
+_ENABLE_CAPTIONS = re.compile(r"^(?:(?:turn on|show) captions|turn captions on)(?:\s*\([^)]+\))?$", re.I)
+_DISABLE_CAPTIONS = re.compile(r"^(?:(?:turn off|hide) captions|turn captions off)(?:\s*\([^)]+\))?$", re.I)
 
 _LEAVE_CALL_JS = (
     "() => { const b = document.querySelector('button[aria-label*=\"eave call\"]');"
@@ -415,19 +419,30 @@ def _ensure_mic_on(page) -> str:
     return "unknown"
 
 
-def _start_captions(page, state: _BotState) -> None:
-    """Observe captions and turn them on in the admitted bot's own browser."""
+def _ensure_captions(page, state: _BotState, *, allow_shortcut: bool = False) -> None:
+    """Enable an explicitly disabled caption control without toggling an enabled one."""
+    if _visible(page.get_by_role("button", name=_DISABLE_CAPTIONS)):
+        if not state.captioning:
+            state.set(captioning=True)
+        return
+    toggle = _visible(page.get_by_role("button", name=_ENABLE_CAPTIONS))
+    if toggle is not None:
+        if state.captioning:
+            state.set(captioning=False)
+        toggle.click(timeout=3_000)
+    elif allow_shortcut:
+        page.keyboard.press("c")
+    else:
+        return
+    if not state.captions_enabled_attempted:
+        state.set(captions_enabled_attempted=True)
+
+
+def _start_captions(page, state: _BotState, *, allow_shortcut: bool = True) -> None:
+    """Install the observer in the current document and enable its captions."""
     try:
         page.evaluate(_CAPTION_OBSERVER_JS)
-        state.set(captioning=True)
-        if _visible(page.get_by_role("button", name=re.compile(r"(turn off|hide) captions", re.I))):
-            return
-        toggle = _visible(page.get_by_role("button", name=re.compile(r"(turn on|show) captions", re.I)))
-        if toggle is not None:
-            toggle.click(timeout=3_000)
-        else:
-            page.keyboard.press("c")
-        state.set(captions_enabled_attempted=True)
+        _ensure_captions(page, state, allow_shortcut=allow_shortcut)
     except Exception as exc:
         state.set(error=f"caption setup failed: {exc}")
 
@@ -439,6 +454,7 @@ def _drain_loop(page, cfg: _BotConfig, state: _BotState, rt: dict, stop_flag: di
     lobby_deadline = time.time() + cfg.lobby_timeout
     last_admission_check = 0.0
     next_participant_check = 0.0
+    next_caption_check = 0.0
     had_company = False
     alone_since = None
     wake = rt.get("wake")
@@ -456,6 +472,7 @@ def _drain_loop(page, cfg: _BotConfig, state: _BotState, rt: dict, stop_flag: di
             if admission == "admitted":
                 state.set(in_call=True, lobby_waiting=False, joined_at=now, mic_state=_ensure_mic_on(page))
                 _start_captions(page, state)
+                next_caption_check = time.monotonic() + _CAPTION_CHECK_INTERVAL
             elif now > lobby_deadline:
                 waited = int(lobby_deadline - state.join_attempted_at) if state.join_attempted_at else 0
                 state.set(lobby_waiting=False,
@@ -479,10 +496,24 @@ def _drain_loop(page, cfg: _BotConfig, state: _BotState, rt: dict, stop_flag: di
             else:
                 alone_since = None
         try:
-            queued = page.evaluate("window.__hermesMeetDrain && window.__hermesMeetDrain()")
+            queued = page.evaluate(_CAPTION_DRAIN_JS)
+            if state.in_call and time.monotonic() >= next_caption_check:
+                next_caption_check = time.monotonic() + _CAPTION_CHECK_INTERVAL
+                if queued is None:
+                    # A new document has no drain function. Wait for the in-call toolbar
+                    # before reinstalling so a reload into the lobby cannot trigger input.
+                    if state.captioning:
+                        state.set(captioning=False)
+                    if _quiet(page.evaluate, _ADMISSION_PROBE_JS) == "admitted":
+                        _start_captions(page, state, allow_shortcut=False)
+                else:
+                    _ensure_captions(page, state)
             for entry in (e for e in (queued if isinstance(queued, list) else ()) if isinstance(e, dict)):
                 speaker = str(entry.get("speaker", ""))
-                state.record_caption(speaker=speaker, text=str(entry.get("text", "")))
+                text = str(entry.get("text", ""))
+                if state.in_call and text.strip() and not state.captioning:
+                    state.set(captioning=True)
+                state.record_caption(speaker=speaker, text=text)
                 if wake is not None and state.in_call:
                     wake.observe(entry, time.monotonic())
                 # Barge-in: a real human spoke while we may be generating audio.
