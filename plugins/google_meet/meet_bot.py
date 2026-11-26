@@ -174,14 +174,30 @@ _LEAVE_CALL_JS = (
     "() => { const b = document.querySelector('button[aria-label*=\"eave call\"]');"
     " if (b) b.click(); }")
 
-# True once past the lobby: leave button, caption region (once our observer is installed)
-# or participant list visible.
+# Require visible controls from the in-call toolbar. The lobby can also
+# contain text or accessible labels mentioning participants.
 _ADMISSION_PROBE_JS = r"""
     (() => {
-      if (document.querySelector('button[aria-label*="eave call" i]')) return true;
-      if (window.__hermesMeetInstalled && document.querySelector(
-          '[role="region"][aria-label*="aption" i], div[jsname="YSxPC"], div[jsname="tgaKEf"]')) return true;
-      return !!document.querySelector('[aria-label*="articipants" i]');
+      const bodyText = document.body?.innerText || '';
+      const visible = (node) => node.getClientRects().length > 0
+        && getComputedStyle(node).visibility === 'visible'
+        && !node.closest('[aria-hidden="true"]');
+      const controls = [...document.querySelectorAll(
+        'button[aria-label], [role="button"][aria-label]'
+      )].filter(visible).map((node) => node.getAttribute('aria-label').trim());
+      const has = (pattern) => controls.some((label) => pattern.test(label));
+      if (/You can['’]t join this video call|You were removed from the meeting|No one responded to your request to join|Your request to join was denied/i.test(bodyText)) {
+        return 'denied';
+      }
+      if (/asking to join|you(?:'|’)ve asked to join|waiting to be admitted|waiting for (?:the )?host to let you in|someone will let you in soon|you(?:'|’)ll join when someone lets you in/i.test(bodyText)
+          || has(/^cancel (?:join )?request$/i)) {
+        return 'lobby';
+      }
+      if (has(/^(?:join now|ask to join)$/i)) return 'pending';
+
+      const leave = has(/^leave call(?:\s*\([^)]+\))?$/i);
+      const inCallControl = has(/^(?:show everyone|(?:turn (?:on|off)|show|hide) captions|turn captions (?:on|off)|present now|chat with everyone)(?:\s*\([^)]+\))?$/i);
+      return leave && inCallControl ? 'admitted' : 'pending';
     })();
     """
 
@@ -206,20 +222,6 @@ _PARTICIPANT_COUNT_JS = r"""
       return counts.size === 1 ? [...counts][0] : null;
     }
     """
-
-
-# English only — what Meet shows when the host denies or removes a guest.
-_DENIED_PROBE_JS = r"""
-    (() => {
-      const text = document.body ? document.body.innerText || '' : '';
-      return /You can't join this video call|You were removed from the meeting|No one responded to your request to join/i.test(text);
-    })();
-    """
-
-
-def _probe(page, js: str) -> bool:
-    """Evaluate a boolean JS probe; conservative — False on any error."""
-    return bool(_quiet(page.evaluate, js))
 
 
 def _visible(locator):
@@ -447,17 +449,21 @@ def _drain_loop(page, cfg: _BotConfig, state: _BotState, rt: dict, stop_flag: di
             return
         if not state.in_call and (now - last_admission_check) > 3.0:
             last_admission_check = now
-            if _probe(page, _ADMISSION_PROBE_JS):
+            admission = _quiet(page.evaluate, _ADMISSION_PROBE_JS)
+            if admission == "denied":
+                state.set(lobby_waiting=False, error="host denied admission", leave_reason="denied")
+                return
+            if admission == "admitted":
                 state.set(in_call=True, lobby_waiting=False, joined_at=now, mic_state=_ensure_mic_on(page))
                 _start_captions(page, state)
             elif now > lobby_deadline:
                 waited = int(lobby_deadline - state.join_attempted_at) if state.join_attempted_at else 0
-                state.set(error=f"lobby timeout — host never admitted the bot within {waited}s",
+                state.set(lobby_waiting=False,
+                          error=f"lobby timeout — host never admitted the bot within {waited}s",
                           leave_reason="lobby_timeout")
                 return
-            elif _probe(page, _DENIED_PROBE_JS):
-                state.set(error="host denied admission", leave_reason="denied")
-                return
+            elif admission == "lobby" and not state.lobby_waiting:
+                state.set(lobby_waiting=True)
         if state.in_call and time.monotonic() >= next_participant_check:
             participants = _quiet(page.evaluate, _PARTICIPANT_COUNT_JS)
             checked_at = time.monotonic()
@@ -487,8 +493,10 @@ def _drain_loop(page, cfg: _BotConfig, state: _BotState, rt: dict, stop_flag: di
             if page.is_closed():  # Meet reloaded or we got booted — exit rather than spin
                 state.set(leave_reason="page_closed")
                 return
-        if wake is not None and state.in_call:
-            wake.poll(state, time.monotonic())
+        if wake is not None and state.in_call and wake.poll(state, time.monotonic()):
+            stop_flag["stop"] = True
+            state.set(leave_reason="voice_requested")
+            return
         if rt["session"] is not None:
             state.set(audio_bytes_out=rt["session"].audio_bytes_out,
                       last_audio_out_at=rt["session"].last_audio_out_at)
@@ -565,7 +573,7 @@ def run_bot() -> int:
             context.close()
             browser.close()
             _teardown_realtime(rt)
-            state.set(in_call=False, captioning=False, exited=True)
+            state.set(in_call=False, lobby_waiting=False, captioning=False, exited=True)
             return 0
     except Exception as e:
         state.set(error=f"unhandled: {e}", exited=True)

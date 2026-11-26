@@ -233,8 +233,10 @@ def _drain(page, state, realtime, wake, stop, *, conversation_id, wake_session=N
                 if listener:
                     listener.observe(entry, now)
             primed = True
-        if listener:
-            listener.poll(state, now)
+        if listener and listener.poll(state, now):
+            stop["stop"] = True
+            state.set(leave_reason="voice_requested")
+            return
         session = realtime.get("session")
         if session:
             pump = realtime.get("pcm_pump")

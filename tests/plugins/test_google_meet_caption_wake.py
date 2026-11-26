@@ -3,8 +3,10 @@
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import pytest
+
 from plugins.google_meet import wake_caption
-from plugins.google_meet.meet_bot import _BotConfig, _BotState, _drain_loop
+from plugins.google_meet.meet_bot import _ADMISSION_PROBE_JS, _BotConfig, _BotState, _drain_loop
 from tests.waiting import wait_until
 
 
@@ -18,10 +20,18 @@ def test_caption_controls_are_used_after_admission(tmp_path):
     stop = {"stop": False}
     events = []
 
-    def evaluate(_script):
-        if not events:
-            events.append("admitted")
-            return True
+    admissions = iter(("lobby", "admitted"))
+    now = [100.0]
+
+    def evaluate(script):
+        if script is _ADMISSION_PROBE_JS:
+            result = next(admissions)
+            events.append(result)
+            return result
+        if events[-1] == "lobby":
+            assert state.lobby_waiting and not state.in_call
+            assert state.joined_at is None and not state.captioning
+            return []
         if events[-1] == "admitted":
             events.append("observer installed")
             return None
@@ -32,11 +42,16 @@ def test_caption_controls_are_used_after_admission(tmp_path):
     page.get_by_role.side_effect = [off_toggle, on_toggle]
     on_toggle.first.click.side_effect = lambda **kw: events.append("captions enabled")
     state = _BotState(tmp_path, "abc-defg-hij", "https://meet.google.com/abc-defg-hij")
-    with patch("plugins.google_meet.meet_bot._ensure_mic_on", return_value="unmuted"):
+    with (
+        patch("plugins.google_meet.meet_bot._ensure_mic_on", return_value="unmuted"),
+        patch("plugins.google_meet.meet_bot.time.time", side_effect=lambda: now[0]),
+        patch("plugins.google_meet.meet_bot.time.sleep", side_effect=lambda seconds: now.__setitem__(0, now[0] + 4)),
+    ):
         _drain_loop(page, _BotConfig(guest_name="Bot", duration_s=0, lobby_timeout=30),
                     state, {"session": None}, stop)
-    assert events == ["admitted", "observer installed", "captions enabled"]
+    assert events == ["lobby", "admitted", "observer installed", "captions enabled"]
     assert state.in_call and state.captioning and state.captions_enabled_attempted
+    assert not state.lobby_waiting and state.joined_at == 104.0
     page.keyboard.press.assert_not_called()
 
 
@@ -123,3 +138,41 @@ def test_google_meet_reuses_wake_chat_saved_at_existing_path(tmp_path, monkeypat
     saved = tmp_path / "workspace" / "meetings" / "abc-defg-hij" / "wake-chat.json"
     assert json.loads(saved.read_text()) == {"session_id": session_id}
     assert process_manager.load_meeting_chat(url) == session_id
+
+
+@pytest.mark.parametrize("phrase", [
+    "leave the meeting",
+    "leave the call",
+    "please leave the meeting",
+    "please leave the call",
+    "Disconnect",
+    "disconnect from the call",
+])
+def test_voice_leave_does_not_wait_for_an_inflight_answer(tmp_path, monkeypatch, phrase):
+    pending_answer = Mock()
+    monkeypatch.setattr(wake_caption, "_answer", pending_answer)
+    listener = wake_caption.CaptionWake("Dev Agent", tmp_path, wake_name="Dev")
+    listener._working = True
+    state = SimpleNamespace(wake_questions=0)
+    listener.observe({"row": 1, "speaker": "Caller", "text": f"Hey Dev, {phrase}."}, 1.0)
+
+    assert listener.poll(state, 2.0) is False
+    assert listener.poll(state, 3.0) is True
+    assert listener.poll(state, 4.0) is False
+    pending_answer.assert_not_called()
+
+
+def test_google_meet_voice_leave_uses_existing_teardown(tmp_path):
+    state = _BotState(tmp_path, "abc-defg-hij", "https://meet.google.com/abc-defg-hij")
+    state.set(in_call=True)
+    listener = Mock()
+    listener.poll.return_value = True
+    page = Mock()
+    page.evaluate.return_value = []
+    stop = {"stop": False}
+
+    _drain_loop(page, _BotConfig(guest_name="Dev Agent", duration_s=0, lobby_timeout=30),
+                state, {"session": None, "wake": listener}, stop)
+
+    assert stop["stop"]
+    assert state.leave_reason == "voice_requested"

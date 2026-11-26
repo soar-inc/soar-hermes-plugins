@@ -64,8 +64,8 @@ def test_state_shows_soar_identity_and_keeps_transcript_in_its_run(tmp_path):
     assert "Hey Dev" in (tmp_path / "transcript.txt").read_text()
 
 
-@pytest.mark.parametrize("wake_name", ["Dev", "Horizon"])
-def test_soar_drains_split_wake_phrase(tmp_path, monkeypatch, wake_name):
+@pytest.mark.parametrize(("wake_name", "voice_leave"), [("Dev", False), ("Horizon", False), ("Dev", True)])
+def test_soar_drains_split_wake_phrase(tmp_path, monkeypatch, wake_name, voice_leave):
     state = bot._SoarState(tmp_path, "room1", "https://meet.soar.inc/chat/room1?join=1")
     answer = Mock(return_value="Four.")
     monkeypatch.setattr(wake_caption, "_answer", answer)
@@ -81,10 +81,11 @@ def test_soar_drains_split_wake_phrase(tmp_path, monkeypatch, wake_name):
     def caption(row, text):
         return {"row": row, "speaker": "Caller", "text": text, "previous": ""}
 
+    request = "leave the call" if voice_leave else "what is two plus two?"
     page.evaluate.side_effect = [
         {"open": True, "entries": []},
         {"open": True, "entries": [caption(1, "Hey")]},
-        {"open": True, "entries": [caption(2, f"{wake_name}, what is two plus two?")]},
+        {"open": True, "entries": [caption(2, f"{wake_name}, {request}")]},
         {"open": True, "entries": []},
     ]
 
@@ -95,5 +96,10 @@ def test_soar_drains_split_wake_phrase(tmp_path, monkeypatch, wake_name):
     page.wait_for_timeout.side_effect = finish_after_trigger
     bot._drain(page, state, {}, "Long Horizon", stop, conversation_id="room1")
     occupancy.assert_called_once_with(page, "room1")
-    assert wait_until(lambda: answer.call_count == 1, timeout=3)
-    answer.assert_called_once_with("what is two plus two?")
+    if voice_leave:
+        assert stop["stop"]
+        assert state.leave_reason == "voice_requested"
+        answer.assert_not_called()
+    else:
+        assert wait_until(lambda: answer.call_count == 1, timeout=3)
+        answer.assert_called_once_with("what is two plus two?")

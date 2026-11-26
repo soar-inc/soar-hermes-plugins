@@ -8,6 +8,14 @@ from pathlib import Path
 from queue import Empty, SimpleQueue
 
 _PUNCTUATION = " ,.!?;:—–-"
+_LEAVE_COMMANDS = {
+    "leave the meeting",
+    "leave the call",
+    "please leave the meeting",
+    "please leave the call",
+    "disconnect",
+    "disconnect from the call",
+}
 
 
 def _answer(question: str) -> str:
@@ -112,12 +120,26 @@ class CaptionWake:
                 return
             self._updated = now
 
-    def poll(self, state, now: float) -> None:
+    def _settled_question(self, now: float) -> str | None:
+        if self._speaker is None:
+            return None
+        question = " ".join(part for _, part in sorted(self._parts.items()) if part)[:500]
+        if now - self._updated < (2 if question else 6):
+            return None
+        return question
+
+    def poll(self, state, now: float) -> bool:
+        """Handle ready captions and return true for an explicit request to leave."""
+        question = self._settled_question(now)
+        if question and question.casefold().strip(_PUNCTUATION) in _LEAVE_COMMANDS:
+            self._speaker, self._parts = None, {}
+            return True
+
         if self._working:
             try:
                 answer, error = self._results.get_nowait()
             except Empty:
-                return
+                return False
             self._working = False
             if answer:
                 from plugins.google_meet.process_manager import append_say
@@ -127,17 +149,14 @@ class CaptionWake:
                     error = "Could not queue the spoken response."
             state.set(wake_error=error)
 
-        if self._speaker is None:
-            return
-        question = " ".join(part for _, part in sorted(self._parts.items()) if part)[:500]
-        if now - self._updated < (2 if question else 6):
-            return
+        if question is None:
+            return False
         self._speaker, self._parts = None, {}
-        if not question:
-            return
-        state.set(wake_questions=state.wake_questions + 1, wake_error=None)
-        self._working = True
-        threading.Thread(target=self._answer, args=(question,), name="meet-wake", daemon=True).start()
+        if question:
+            state.set(wake_questions=state.wake_questions + 1, wake_error=None)
+            self._working = True
+            threading.Thread(target=self._answer, args=(question,), name="meet-wake", daemon=True).start()
+        return False
 
     def _answer(self, question: str) -> None:
         try:
