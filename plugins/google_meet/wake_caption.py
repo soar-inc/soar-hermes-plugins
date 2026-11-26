@@ -6,6 +6,7 @@ import re
 import threading
 from pathlib import Path
 from queue import Empty, SimpleQueue
+from typing import Callable
 
 _PUNCTUATION = " ,.!?;:—–-"
 _LEAVE_COMMANDS = {
@@ -53,7 +54,8 @@ def _answer(question: str) -> str:
 
 class CaptionWake:
     def __init__(self, bot_name: str, out_dir: Path, *, wake_session: str | None = None,
-                 wake_name: str | None = None, wake_aliases: tuple[str, ...] = ()) -> None:
+                 wake_name: str | None = None, wake_aliases: tuple[str, ...] = (),
+                 on_prompt: Callable[[str], str] | None = None) -> None:
         word = wake_name
         if word is None:
             from hermes_cli.config import load_config_readonly
@@ -73,6 +75,7 @@ class CaptionWake:
         self._bot_names = {bot_name.strip().casefold(), "you"} - {""}
         self._queue_path = out_dir / "say_queue.jsonl"
         self._wake_session = wake_session
+        self._on_prompt = on_prompt
         self._speaker: str | None = None
         self._parts: dict[int, str] = {}
         self._marker_row = -1
@@ -160,7 +163,9 @@ class CaptionWake:
 
     def _answer(self, question: str) -> None:
         try:
-            if self._wake_session:
+            if self._on_prompt:
+                answer = self._on_prompt(question)
+            elif self._wake_session:
                 from plugins.meeting_wake_chat import answer_in_chat
 
                 answer = answer_in_chat(self._wake_session, question)

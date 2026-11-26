@@ -54,7 +54,14 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
                               help="Also install realtime audio tools (pulseaudio-utils on Linux, BlackHole+ffmpeg on macOS). Uses sudo/brew, prompts before invoking either.")
     p["install"].add_argument("--yes", "-y", action="store_true",
                               help="Answer yes to all prompts (use with care; will run sudo apt-get or brew without asking).")
+    auth_mode = p["auth"].add_mutually_exclusive_group()
+    auth_mode.add_argument("--flowmind", action="store_true",
+                           help="Sign in to FlowMind on the profile's Bot Screen")
+    auth_mode.add_argument("--voice-share", action="store_true",
+                           help="Sign in to Google using the persistent presentation browser on Bot Screen")
     p["join"].add_argument("url", help="https://meet.google.com/...")
+    p["join"].add_argument("--voice-share", action="store_true",
+                           help="Let Hermes present tabs on Bot Screen (requires realtime and wake)")
     p["join"].add_argument("--guest-name", default="Hermes Agent")
     p["join"].add_argument("--duration", default=None, help="e.g. 30m, 2h, 90s")
     p["join"].add_argument("--headed", action="store_true", help="show browser")
@@ -79,10 +86,10 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
 _DISPATCH = {
     "setup": lambda a: _cmd_setup(),
     "install": lambda a: _cmd_install(realtime=bool(a.realtime), assume_yes=bool(a.yes)),
-    "auth": lambda a: _cmd_auth(),
+    "auth": lambda a: _cmd_auth(flowmind=a.flowmind, voice_share=a.voice_share),
     "join": lambda a: _cmd_join(url=a.url, guest_name=a.guest_name, duration=a.duration, headed=a.headed,
                                 mode=a.mode, node=a.node, wake=a.wake, wake_session=a.wake_session,
-                                resume_wake_chat=a.resume_wake_chat),
+                                resume_wake_chat=a.resume_wake_chat, voice_share=a.voice_share),
     "status": lambda a: _print_result(pm.status()),
     "transcript": lambda a: _cmd_transcript(last=a.last),
     "say": lambda a: _cmd_say(text=a.text, node=a.node),
@@ -120,8 +127,15 @@ def _cmd_setup() -> int:
         except Exception as e:
             chromium_msg = f"probe failed: {e}"
     print(f"  chromium       : {chromium_msg}")
-    auth_path = _auth_state_path()
-    print("  google auth    : " + (f"ok ({auth_path})" if auth_path.is_file() else "not saved — run: hermes meet auth"))
+    from plugins.google_meet.chrome_profile import chrome_profile_path, persistent_chrome_enabled
+
+    if persistent_chrome_enabled():
+        profile = chrome_profile_path()
+        auth_message = f"persistent Chrome profile ({profile})" if profile.is_dir() else "run: hermes meet auth"
+    else:
+        auth_path = _auth_state_path()
+        auth_message = f"ok ({auth_path})" if auth_path.is_file() else "not saved — run: hermes meet auth"
+    print("  google auth    : " + auth_message)
     print()
     all_ok = system_ok and pw_ok and chromium_ok
     print("ready. Join a meeting:  hermes meet join https://meet.google.com/abc-defg-hij" if all_ok
@@ -200,13 +214,21 @@ def _cmd_install(*, realtime: bool, assume_yes: bool) -> int:
     return 0
 
 
-def _cmd_auth() -> int:
+def _cmd_auth(*, flowmind: bool = False, voice_share: bool = False) -> int:
     """Open a headed Chromium, let the user sign in, save storage_state."""
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
         print("playwright is not installed. Run: hermes meet install")
         return 1
+    if flowmind:
+        from plugins.google_meet.presentation import authorize_dashboard
+
+        return authorize_dashboard()
+    from plugins.google_meet.chrome_profile import authorize_meet_chrome, persistent_chrome_enabled
+
+    if voice_share or persistent_chrome_enabled():
+        return authorize_meet_chrome()
     path = _auth_state_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     print("opening Chromium — sign in to Google, then return here and press Enter.\n"
@@ -254,10 +276,12 @@ def _remote(node: str, op: str, call) -> int:
 
 def _cmd_join(url: str, *, guest_name: str, duration: Optional[str], headed: bool,
               mode: str = "transcribe", node: Optional[str] = None, wake: bool = False,
-              wake_session: Optional[str] = None, resume_wake_chat: bool = False) -> int:
+              wake_session: Optional[str] = None, resume_wake_chat: bool = False, voice_share: bool = False) -> int:
     if not _is_safe_meet_url(url):
         print(f"refusing: not a meet.google.com URL: {url}")
         return 2
+    if voice_share and (not wake or mode != "realtime" or node):
+        return _print_result({"ok": False, "error": "--voice-share requires a local realtime join with --wake"})
     if wake and (mode != "realtime" or node):
         return _print_result({"ok": False, "error": "--wake requires local --mode realtime"})
     if wake_session is not None or resume_wake_chat:
@@ -281,7 +305,7 @@ def _cmd_join(url: str, *, guest_name: str, duration: Optional[str], headed: boo
     auth = _auth_state_path()
     return _print_result(pm.start(url=url, headed=headed, guest_name=guest_name, duration=duration,
                                   auth_state=str(auth) if auth.is_file() else None, mode=mode, wake=wake,
-                                  wake_session=wake_session))
+                                  wake_session=wake_session, voice_share=voice_share))
 
 
 def _cmd_say(text: str, node: Optional[str] = None) -> int:

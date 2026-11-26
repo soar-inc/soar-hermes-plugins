@@ -18,6 +18,7 @@ import subprocess
 import sys
 import threading
 import time
+from contextlib import ExitStack
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Optional
@@ -67,6 +68,8 @@ _STATUS_FIELDS = (
     ("lastAudioOutAt", "last_audio_out_at", None), ("lastBargeInAt", "last_barge_in_at", None),
     ("wakeEnabled", "wake_enabled", False), ("wakeQuestions", "wake_questions", 0),
     ("wakeError", "wake_error", None), ("wakeSessionId", "wake_session_id", None),
+    ("presentationState", "presentation_state", None), ("presentationTab", "presentation_tab", None),
+    ("presentationError", "presentation_error", None),
     ("leaveReason", "leave_reason", None), ("micState", "mic_state", None))
 
 
@@ -374,6 +377,7 @@ def _config_from_env() -> _BotConfig:
         out_dir=Path(out_raw) if out_raw else None,
         headed=env("HERMES_MEET_HEADED", "").lower() in {"1", "true", "yes"},
         auth_state=env("HERMES_MEET_AUTH_STATE", "").strip(),
+        voice_share=env("HERMES_MEET_VOICE_SHARE") == "1",
         guest_name=env("HERMES_MEET_GUEST_NAME", "Hermes Agent"),
         duration_s=_parse_duration(env("HERMES_MEET_DURATION", "")),
         realtime=env("HERMES_MEET_MODE", "transcribe").strip().lower() == "realtime",
@@ -524,6 +528,8 @@ def _drain_loop(page, cfg: _BotConfig, state: _BotState, rt: dict, stop_flag: di
             if page.is_closed():  # Meet reloaded or we got booted — exit rather than spin
                 state.set(leave_reason="page_closed")
                 return
+        if (presentation := rt.get("presentation")) is not None and state.in_call:
+            _quiet(presentation.poll)
         if wake is not None and state.in_call and wake.poll(state, time.monotonic()):
             stop_flag["stop"] = True
             state.set(leave_reason="voice_requested")
@@ -569,23 +575,53 @@ def run_bot() -> int:
         if rt["bridge"]:
             rt["bridge"].teardown()
         return 3
+    from plugins.google_meet.chrome_profile import meet_chrome_profile, persistent_chrome_enabled
+
+    use_persistent_chrome = cfg.voice_share or persistent_chrome_enabled()
     chrome_args = ["--use-fake-ui-for-media-stream", "--disable-blink-features=AutomationControlled"]
+    if cfg.voice_share:
+        chrome_args.remove("--use-fake-ui-for-media-stream")
+        from plugins.google_meet.presentation import capture_browser_config
+
+        capture_key, capture_guard = capture_browser_config(cfg.url)
+        chrome_args.append(f"--auto-select-tab-capture-source-by-title={capture_key}")
     if not rt["enabled"]:
         chrome_args.insert(1, "--use-fake-device-for-media-stream")  # silent fake mic
     elif rt["bridge_info"] and rt["bridge_info"].get("platform") == "linux":
         # Playwright's launch() takes no env: set PULSE_SOURCE on ourselves so Chrome inherits it.
         os.environ["PULSE_SOURCE"] = rt["bridge_info"].get("device_name", "")
     context_args = dict(_CONTEXT_ARGS)
-    if cfg.auth_state and Path(cfg.auth_state).is_file():
-        context_args["storage_state"] = cfg.auth_state
+    if use_persistent_chrome:
+        context_args.pop("permissions")
+        context_args.pop("user_agent")  # Keep the same browser identity used by the sign-in helper.
+    if cfg.voice_share:
+        context_args["service_workers"] = "block"
+    auth_state = cfg.auth_state if cfg.auth_state and Path(cfg.auth_state).is_file() else None
     try:
-        with sync_playwright() as pw:
-            browser = pw.chromium.launch(
-                channel="chromium", executable_path=chromium_executable(),
-                headless=not cfg.headed, args=chrome_args,
-            )
-            context = browser.new_context(**context_args)
-            page = context.new_page()
+        with sync_playwright() as pw, ExitStack() as stack:
+            launch_args = dict(channel="chromium", executable_path=chromium_executable(),
+                               headless=not cfg.headed, args=chrome_args)
+            if use_persistent_chrome:
+                from plugins.google_meet.presentation import seed_legacy_flowmind
+
+                profile = stack.enter_context(meet_chrome_profile())
+                if cfg.voice_share:
+                    launch_args["ignore_default_args"] = ["--disable-infobars"]
+                context = pw.chromium.launch_persistent_context(profile, **launch_args, **context_args)
+                stack.callback(_quiet, context.close)
+                seed_legacy_flowmind(context, profile)
+                context.grant_permissions(["microphone", "camera"], origin="https://meet.google.com")
+                if cfg.voice_share:
+                    context.add_init_script(capture_guard)
+                page = context.pages[0]
+            else:
+                browser = pw.chromium.launch(**launch_args)
+                stack.callback(_quiet, browser.close)
+                if auth_state:
+                    context_args["storage_state"] = auth_state
+                context = browser.new_context(**context_args)
+                stack.callback(_quiet, context.close)
+                page = context.new_page()
             try:
                 page.goto(cfg.url, wait_until="domcontentloaded", timeout=30_000)
             except Exception as e:
@@ -597,12 +633,26 @@ def run_bot() -> int:
                 _start_realtime_speaker(rt, cfg, stop_flag, state)
                 if state.realtime_ready and os.environ.get("HERMES_MEET_WAKE") == "1":
                     wake_session = os.environ.get("HERMES_MEET_WAKE_SESSION") or None
-                    rt["wake"] = CaptionWake(cfg.guest_name, cfg.out_dir, wake_session=wake_session)
+                    on_prompt = None
+                    if cfg.voice_share:
+                        from plugins.google_meet.agent_turn import MeetAgentTurn
+                        from plugins.google_meet.presentation import Presentation
+
+                        presentation = Presentation(page, state, capture_key=capture_key)
+                        rt["presentation"] = presentation
+                        on_prompt = MeetAgentTurn(presentation, wake_session)
+                        state.set(presentation_state="idle")
+                    rt["wake"] = CaptionWake(
+                        cfg.guest_name, cfg.out_dir, wake_session=wake_session, on_prompt=on_prompt,
+                    )
                     state.set(wake_enabled=True, wake_session_id=wake_session)
-            _drain_loop(page, cfg, state, rt, stop_flag)
+            try:
+                _drain_loop(page, cfg, state, rt, stop_flag)
+            finally:
+                if (presentation := rt.get("presentation")) is not None:
+                    presentation.close()
             _quiet(page.evaluate, _LEAVE_CALL_JS)
-            context.close()
-            browser.close()
+            stack.close()
             _teardown_realtime(rt)
             state.set(in_call=False, lobby_waiting=False, captioning=False, exited=True)
             return 0
