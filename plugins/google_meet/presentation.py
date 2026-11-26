@@ -15,6 +15,8 @@ from pathlib import Path
 from queue import Empty, SimpleQueue
 from urllib.parse import urljoin, urlsplit
 
+from plugins.google_meet.flowmind_session import FlowMindSession, FlowMindSessionError
+
 _FLOWMIND = "https://build.soar.inc"
 _DASHBOARD = f"{_FLOWMIND}/dashboard"
 _PRESENT = re.compile(r"^(?:present now|start presenting|share (?:your )?screen)(?:[ (].*\))?$", re.I)
@@ -282,6 +284,7 @@ class Presentation:
         self.meet = meet_page
         self.state = state
         self.tab = None
+        self.flowmind_session = None
         self.capture_key = capture_key
         self.title = ""
         self.url = ""
@@ -334,6 +337,14 @@ class Presentation:
         if self._capture() == "capturing" or _control(self.meet, _STOP):
             raise PresentationError("There's already a presentation running from my Meet tab.")
 
+        flowmind = FlowMindSession.for_url(self.meet.context, url)
+        if flowmind:
+            try:
+                flowmind.ensure()
+            except FlowMindSessionError as exc:
+                raise PresentationSignInRequired(str(exc)) from exc
+            url = flowmind.view_url
+
         tab = self.meet.context.new_page()
         try:
             navigation_errors = []
@@ -341,11 +352,18 @@ class Presentation:
             tab.on("popup", lambda popup: popup.close())
             try:
                 response = tab.goto(url, wait_until="domcontentloaded", timeout=15_000)
+                if flowmind and response is not None and response.status == 401:
+                    flowmind.ensure(force=True)
+                    response = tab.goto(url, wait_until="domcontentloaded", timeout=15_000)
+            except FlowMindSessionError as exc:
+                raise PresentationSignInRequired(str(exc)) from exc
             except Exception as exc:
                 error = navigation_errors[-1] if navigation_errors else PresentationError("The requested page couldn't load.")
                 raise error from exc
             final_url = _presentation_url(tab.url)
-            if _sign_in_path(final_url) or (response is not None and response.status == 401):
+            if flowmind and final_url != flowmind.view_url:
+                raise PresentationError("FlowMind redirected away from its read-only dashboard.")
+            if (not flowmind and _sign_in_path(final_url)) or (response is not None and response.status == 401):
                 raise PresentationSignInRequired("Dev needs a browser sign-in to present this page.")
             if response is None or not response.ok:
                 raise PresentationError("The requested page didn't load successfully.")
@@ -366,6 +384,7 @@ class Presentation:
             raise
 
         self.tab, self.title, self.url = tab, title, final_url
+        self.flowmind_session = flowmind
         self.until = time.monotonic() + 20
         self._phase("verifying-presentation")
 
@@ -407,6 +426,12 @@ class Presentation:
         if self.tab is not None and (self.tab.is_closed() or self.tab.url != self.url):
             self._failure("The shared page changed or closed.")
             return
+        if self.flowmind_session is not None:
+            try:
+                self.flowmind_session.maintain()
+            except FlowMindSessionError as exc:
+                self._failure(str(exc), phase="sign-in-required")
+                return
         if self.phase == "verifying-presentation":
             capture = self._capture()
             if capture == "capturing":
@@ -445,6 +470,7 @@ class Presentation:
             with suppress(Exception):
                 self.tab.close()
         self.tab, self.title, self.url = None, "", ""
+        self.flowmind_session = None
         self._phase("idle")
 
     def close(self) -> None:
