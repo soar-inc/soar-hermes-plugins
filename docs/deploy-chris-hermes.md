@@ -109,3 +109,23 @@ Use a test event on the watched calendar. Attach Google conferencing for a Googl
 Look for `inCall`, `realtimeReady` and `wakeEnabled`. Ask a read-only question such as “Hey Horizon, list my FlowMind projects.” Check that the reply is audible and that the Hermes chat in **Sessions** has the event's title and date. Job output is under `$profile_dir/cron/output/<job-id>/`. Use `meet stop` or `soar-meet stop` under the same profile to end a test bot run.
 
 For a rollback, pause the watcher job and stop the bot, then restore the previous plugin, shared module, and watcher code from the deployment backup or the previous reviewed release. Preserve the profile's credential and meeting-data directories.
+
+## FlowMind sign-in for Google Meet presentations
+
+Deploy the FlowMind presentation session check before installing these plugin changes.
+On Bot Screen, register the FlowMind account Dev should use:
+
+```bash
+hermes -p long-horizon meet auth --flowmind
+```
+
+Use **Continue with SOAR** if available. The operator signs in and confirms the account
+in the persistent Meet Chrome profile. Dev uses that account's existing permissions.
+
+Join Google Meet with `--mode realtime --wake --voice-share` and ask Dev to share a FlowMind
+dashboard, project, board or ticket. Dev presents the requested page at its normal FlowMind URL
+from the same call. The plugin checks the account before sharing and periodically during a share.
+FlowMind's normal session refresh runs during these checks. If the app session has ended, Dev
+tries FlowMind's usual browser sign-in once in a separate tab so an existing SOAR session can
+renew it. If the account changes or sign-in needs a person, Dev stops and reports it. To change
+the account, sign in with the intended account and rerun the setup command.

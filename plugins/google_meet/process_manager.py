@@ -100,11 +100,22 @@ def start(url: str, *, out_dir: Optional[Path] = None, headed: bool = False,
           session_id: Optional[str] = None, mode: str = "transcribe", realtime_model: Optional[str] = None,
           realtime_voice: Optional[str] = None, realtime_instructions: Optional[str] = None,
           realtime_api_key: Optional[str] = None, wake: bool = False,
-          wake_session: Optional[str] = None) -> dict[str, Any]:
+          wake_session: Optional[str] = None, voice_share: bool = False) -> dict[str, Any]:
     """Spawn the meet_bot subprocess for *url*, stopping any running bot first (one active meeting)."""
     from plugins.google_meet.meet_bot import _is_safe_meet_url, _meeting_id_from_url
     if not _is_safe_meet_url(url):
         return {"ok": False, "error": "refusing: only https://meet.google.com/ URLs are allowed. got: " + repr(url)}
+    desktop_env = None
+    if voice_share:
+        from plugins.google_meet.presentation import PresentationError, bot_screen_env
+
+        if not wake or mode != "realtime":
+            return {"ok": False, "error": "Voice sharing requires a realtime join with wake enabled."}
+        try:
+            desktop_env = bot_screen_env(dict(os.environ))
+        except PresentationError as exc:
+            return {"ok": False, "error": str(exc)}
+        headed = True
     if _pid_alive(int((_read_active() or {}).get("pid", 0))):
         stop(reason="replaced by new meet_join")
     meeting_id = _meeting_id_from_url(url)
@@ -114,10 +125,12 @@ def start(url: str, *, out_dir: Optional[Path] = None, headed: bool = False,
     for name in ("transcript.txt", "status.json"):
         with contextlib.suppress(OSError):
             (out / name).unlink()
-    env = {**os.environ, "HERMES_MEET_URL": url, "HERMES_MEET_OUT_DIR": str(out),
+    env = {**(desktop_env or os.environ), "HERMES_HOME": str(get_hermes_home()),
+           "HERMES_MEET_URL": url, "HERMES_MEET_OUT_DIR": str(out),
            "HERMES_MEET_GUEST_NAME": guest_name,
            "HERMES_MEET_WAKE": "1" if wake else "0",
-           "HERMES_MEET_WAKE_SESSION": wake_session or ""}
+           "HERMES_MEET_WAKE_SESSION": wake_session or "",
+           "HERMES_MEET_VOICE_SHARE": "1" if voice_share else "0"}
     for value, var in (
         (headed and "1", "HERMES_MEET_HEADED"),
         (auth_state, "HERMES_MEET_AUTH_STATE"),
