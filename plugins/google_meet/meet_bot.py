@@ -134,12 +134,22 @@ _CAPTION_OBSERVER_JS = r"""
     });
   }
 
+  function visible(element) {
+    if (!element.getClientRects().length) return false;
+    if (typeof element.checkVisibility === 'function') {
+      return element.checkVisibility({checkOpacity: true, checkVisibilityCSS: true});
+    }
+    const style = getComputedStyle(element);
+    return style.visibility !== 'hidden' && style.visibility !== 'collapse';
+  }
+
   function scan(root) {
     // Meet captions render as rows of speaker label + text block. Selectors
     // vary across Meet rewrites; try a few shapes and fall back to raw text.
     const rows = root.querySelectorAll('div[jsname="dsyhDe"], div.CNusmb, div.TBMuR');
     if (rows.length) {
       rows.forEach((row) => {
+        if (!visible(row)) return;
         const spkEl = row.querySelector('div.KcIKyf, div.zs7s8d, span[jsname="YSxPC"]');
         const txtEl = row.querySelector('div.bh44bd, span[jsname="tgaKEf"], div.iTTPOb');
         pushEntry(row, spkEl ? spkEl.innerText : '', txtEl ? txtEl.innerText : row.innerText);
@@ -150,16 +160,23 @@ _CAPTION_OBSERVER_JS = r"""
     pushEntry(root, '', (root.innerText || '').split('\n').filter(Boolean).pop());
   }
 
-  let attached = null;
-  const observer = new MutationObserver(() => { if (attached) scan(attached); });
+  let attached = [];
+  const options = { childList: true, subtree: true, characterData: true };
+  const scanVisible = () => attached.filter(visible).forEach(scan);
+  const observer = new MutationObserver(scanVisible);
   function attach() {
-    const region = document.querySelector(captionSelector);
-    if (region === attached) return;
-    observer.disconnect();
-    attached = region;
-    if (!region) return;
-    observer.observe(region, { childList: true, subtree: true, characterData: true });
-    scan(region);
+    // Meet can leave a hidden copy mounted when switching between call layouts.
+    // Observe each visible region once, even if a legacy selector matches a child.
+    const candidates = Array.from(document.querySelectorAll(captionSelector)).filter(visible);
+    const regions = candidates.filter(region =>
+      !candidates.some(other => other !== region && other.contains(region)));
+    if (regions.length !== attached.length || regions.some((region, i) => region !== attached[i])) {
+      observer.disconnect();
+      attached = regions;
+      attached.forEach(region => observer.observe(region, options));
+    }
+    // Visibility can change without a text mutation, including on an existing row.
+    scanVisible();
   }
   attach();
   setInterval(attach, 500);

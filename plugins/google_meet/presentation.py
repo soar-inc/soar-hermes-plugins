@@ -209,13 +209,16 @@ _CAPTURE_GUARD = r"""
         Object.defineProperty(window, '__hermesMeetShare', { value: (key, command) => {
             if (key !== cfg.key) return null;
             if (command === 'arm') {
+                liveTrack = undefined;
                 until = performance.now() + 20000;
                 state = 'armed';
             } else if (command === 'disarm') {
                 until = 0;
                 if (state === 'armed' || state === 'selecting') state = 'cancelled';
             }
-            return liveTrack?.readyState === 'live' ? 'capturing' : state;
+            // Meet can stop its track directly, which does not emit 'ended'.
+            if (liveTrack) return liveTrack.readyState === 'live' ? 'capturing' : 'ended';
+            return state;
         }});
     }
     Object.defineProperty(devices, 'getDisplayMedia', { value: async options => {
@@ -235,11 +238,9 @@ _CAPTURE_GUARD = r"""
             }
             liveTrack = track;
             state = 'capturing';
-            track.addEventListener('ended', () => { state = 'ended'; }, { once: true });
             track.addEventListener('capturehandlechange', () => {
                 if (track.getCaptureHandle()?.handle !== cfg.key) {
                     stream.getTracks().forEach(item => item.stop());
-                    state = 'ended';
                 }
             });
             return stream;
