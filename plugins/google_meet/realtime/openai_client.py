@@ -9,6 +9,7 @@ from __future__ import annotations
 import base64
 import contextlib
 import json
+import sys
 import threading
 import time
 import uuid
@@ -44,6 +45,9 @@ class RealtimeSession:
         self.sample_rate = sample_rate
         self._ws: Any = None
         self._send_lock = threading.Lock()
+        self._active_response_id: Optional[str] = None
+        self._cancel_sent = False
+        self._closed = False
         self.audio_bytes_out: int = 0  # public counters for status reporting
         self.last_audio_out_at: Optional[float] = None
 
@@ -56,11 +60,20 @@ class RealtimeSession:
                                "install with: pip install websockets") from exc
         url = f"{REALTIME_URL}?model={self.model}"
         headers = [("Authorization", f"Bearer {self.api_key}")]
-        # Newer websockets takes additional_headers=, older extra_headers=.
+        # Allow brief network stalls while still detecting dead sockets.
+        options = {"ping_interval": 20, "ping_timeout": 45, "close_timeout": 3}
         try:
-            self._ws = connect(url, additional_headers=headers)
+            ws = connect(url, additional_headers=headers, **options)
         except TypeError:
-            self._ws = connect(url, extra_headers=headers)
+            ws = connect(url, extra_headers=headers)
+        with self._send_lock:
+            closed = self._closed
+            if not closed:
+                self._ws = ws
+        if closed:
+            with contextlib.suppress(Exception):
+                ws.close()
+            raise RuntimeError("Realtime session is closed")
         try:
             self._send_json({"type": "session.update", "session": {
                 "type": "realtime",
@@ -82,24 +95,64 @@ class RealtimeSession:
                 if frame.get("type") == "error":
                     raise RuntimeError(f"realtime session update failed: {frame.get('error') or frame}")
         except Exception:
-            self.close()
+            self._disconnect()
             raise
 
-    def close(self) -> None:
-        if self._ws is not None:
+    def _disconnect(self) -> None:
+        with self._send_lock:
+            ws, self._ws = self._ws, None
+            self._active_response_id = None
+        if ws is not None:
             with contextlib.suppress(Exception):
-                self._ws.close()
-            self._ws = None
+                ws.close()
 
-    def speak(self, text: str, timeout: float = 30.0) -> dict:
-        """Send ``text`` and append the audio response to ``audio_sink_path`` (opened 'ab' per call
-        so a streaming reader can consume it). Frames other than audio deltas/terminal/error are ignored."""
-        if self._ws is None:
-            raise RuntimeError("RealtimeSession.connect() must be called first")
+    def close(self) -> None:
+        with self._send_lock:
+            self._closed = True
+        self._disconnect()
+
+    def speak(self, text: str, timeout: float = 30.0, *, timings: dict[str, int | None] | None = None) -> dict:
+        """Reconnect and retry once if transport fails before any reply audio is written."""
+        from websockets.exceptions import ConnectionClosed
+
+        for attempt in range(2):
+            with self._send_lock:
+                if self._closed:
+                    raise RuntimeError("Realtime session is closed")
+                self._active_response_id = None
+                self._cancel_sent = False
+            before = self.audio_bytes_out
+            try:
+                if self._ws is None:
+                    self.connect()
+                return self._speak_once(text, timeout, timings)
+            except (ConnectionClosed, OSError):
+                with self._send_lock:
+                    cancelled, closed = self._cancel_sent, self._closed
+                self._disconnect()
+                # Do not repeat a reply the attendee interrupted or partly heard.
+                if attempt or cancelled or closed or self.audio_bytes_out != before:
+                    raise
+            except Exception:
+                self._disconnect()
+                raise
+            finally:
+                with self._send_lock:
+                    self._active_response_id = None
+                    self._cancel_sent = False
+
+    def _speak_once(self, text: str, timeout: float, timings: dict[str, int | None] | None) -> dict:
+        """Send text and stream the reply to the file consumed by the audio bridge."""
         start = time.monotonic()
         self._send_json({"type": "conversation.item.create", "item": {
             "type": "message", "role": "user", "content": [{"type": "input_text", "text": text}]}})
         self._send_json({"type": "response.create", "response": {"output_modalities": ["audio"]}})
+        if timings is not None:
+            timings.update(
+                realtime_sent_at_ns=time.time_ns(),
+                response_created_at_ns=None,
+                first_audio_frame_received_at_ns=None,
+            )
         bytes_written = 0
         with contextlib.ExitStack() as stack:
             sink_fp = None
@@ -107,17 +160,36 @@ class RealtimeSession:
                 self.audio_sink_path.parent.mkdir(parents=True, exist_ok=True)
                 sink_fp = stack.enter_context(open(self.audio_sink_path, "ab"))
             while True:
-                frame = self._recv_frame(start + timeout, timeout)
-                if frame is None or frame.get("type") in _TERMINAL_FRAMES:  # peer closed / response done
-                    break
+                frame = self._recv_frame(start + timeout, timeout, timings=timings)
+                if frame is None:
+                    raise ConnectionError("Realtime connection closed before the response completed")
                 ftype = frame.get("type")
+                if ftype == "response.created":
+                    response_id = (frame.get("response") or {}).get("id")
+                    if isinstance(response_id, str) and response_id:
+                        with self._send_lock:
+                            self._active_response_id = response_id
+                    continue
+                if ftype in _TERMINAL_FRAMES:
+                    response = frame.get("response") or {}
+                    with self._send_lock:
+                        self._active_response_id = None
+                    if response.get("status") in {"failed", "incomplete"}:
+                        raise RuntimeError(f"Realtime response {response['status']}")
+                    break
                 if ftype == "error":
-                    raise RuntimeError(f"realtime error: {frame.get('error') or frame}")
+                    error = frame.get("error") or {}
+                    if error.get("code") == "response_cancel_not_active":
+                        # The server can finish just before an in-flight cancel arrives.
+                        continue
+                    raise RuntimeError(f"realtime error: {error or frame}")
                 chunk = _decode_audio(frame.get("delta") or frame.get("audio") or "") if (
                     ftype == "response.output_audio.delta" and sink_fp is not None) else b""
                 if chunk:
                     sink_fp.write(chunk)
                     sink_fp.flush()
+                    if timings is not None and bytes_written == 0:
+                        timings["first_pcm_at_ns"] = time.time_ns()
                     bytes_written += len(chunk)
                     self.audio_bytes_out += len(chunk)
                     self.last_audio_out_at = time.time()
@@ -125,36 +197,56 @@ class RealtimeSession:
 
     def cancel_response(self) -> bool:
         """Barge-in: send ``response.cancel``. True if sent, False if nothing to cancel / socket closed."""
-        if self._ws is None:
-            return False
-        try:
-            self._send_json({"type": "response.cancel"})
+        with self._send_lock:
+            ws = self._ws
+            response_id = self._active_response_id
+            if self._closed or ws is None or response_id is None or self._cancel_sent:
+                return False
+            try:
+                ws.send(json.dumps({"type": "response.cancel", "response_id": response_id}))
+            except Exception:
+                return False
+            self._cancel_sent = True
             return True
-        except Exception:
-            return False
 
     def _send_json(self, payload: dict) -> None:
-        assert self._ws is not None
         with self._send_lock:
+            if self._ws is None:
+                raise ConnectionError("Realtime connection is closed")
             self._ws.send(json.dumps(payload))
 
-    def _recv_frame(self, deadline: float, timeout: float) -> Optional[dict]:
+    def _recv_frame(self, deadline: float, timeout: float, *,
+                    timings: dict[str, int | None] | None = None) -> Optional[dict]:
         """Next dict frame before *deadline* (monotonic), ``None`` once the peer closes.
         Non-dict / unparseable frames are skipped; TimeoutError past the deadline."""
-        assert self._ws is not None
+        ws = self._ws
+        if ws is None:
+            raise ConnectionError("Realtime connection is closed")
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError(f"realtime response did not complete within {timeout}s")
             try:
-                raw = self._ws.recv(timeout=remaining)
+                raw = ws.recv(timeout=remaining)
             except TypeError:  # older websockets: no timeout kwarg
-                raw = self._ws.recv()
+                raw = ws.recv()
             if raw is None:
                 return None
+            received_at_ns = None
+            if timings is not None and (
+                timings["response_created_at_ns"] is None or timings["first_audio_frame_received_at_ns"] is None
+            ):
+                received_at_ns = time.time_ns()
             with contextlib.suppress(TypeError, ValueError):
                 frame = json.loads(raw) if isinstance(raw, (str, bytes, bytearray)) else raw
                 if isinstance(frame, dict):
+                    if timings is not None and received_at_ns is not None:
+                        event = frame.get("type")
+                        if event == "response.created" and timings["response_created_at_ns"] is None:
+                            timings["response_created_at_ns"] = received_at_ns
+                        elif (event == "response.output_audio.delta" and (frame.get("delta") or frame.get("audio"))
+                              and timings["first_audio_frame_received_at_ns"] is None):
+                            timings["first_audio_frame_received_at_ns"] = received_at_ns
                     return frame
 
 
@@ -193,21 +285,40 @@ class RealtimeSpeaker:
         with open(self.processed_path, "a", encoding="utf-8") as fp:
             fp.write(json.dumps(record) + "\n")
 
-    def run_until_stopped(self, stop_fn: Callable[[], bool], poll_interval: float = 0.5) -> None:
+    def run_until_stopped(self, stop_fn: Callable[[], bool], poll_interval: float = 0.5, *,
+                          queue_ready: threading.Event | None = None) -> None:
         while not stop_fn():
+            # Clear before reading so an append between the read and wait still wakes us.
+            if queue_ready is not None:
+                queue_ready.clear()
             entries = self._read_queue()
             if not entries:
-                time.sleep(poll_interval)
+                if queue_ready is None:
+                    time.sleep(poll_interval)
+                else:
+                    queue_ready.wait(poll_interval)  # also poll for external meet say writers
                 continue
             # One entry per iteration: the queue may grow while we speak.
             head = entries[0]
             text = (head.get("text") or "").strip()
             result = {"ok": True, "bytes_written": 0, "duration_ms": 0.0}
+            text_ready, queued_at = head.get("text_ready_at_ns"), head.get("queued_at_ns")
+            timings = None
+            if isinstance(text_ready, int) and isinstance(queued_at, int):
+                timings = {
+                    "text_ready_at_ns": text_ready, "queued_at_ns": queued_at,
+                    "realtime_sent_at_ns": None, "response_created_at_ns": None,
+                    "first_audio_frame_received_at_ns": None, "first_pcm_at_ns": None,
+                }
             if text:
                 try:
-                    result = self.session.speak(text)
+                    result = self.session.speak(text, **({"timings": timings} if timings is not None else {}))
                 except Exception as exc:
                     result = {"ok": False, "error": str(exc)}
+            if timings is not None:
+                record = {"id": head["id"], "ok": result["ok"], **timings}
+                with contextlib.suppress(OSError):
+                    print("MEET_SPEECH_TIMING " + json.dumps(record), file=sys.stderr, flush=True)
             self._append_processed(head, result)
             # Re-read (new entries may have arrived), then drop the head by position or id — under the
             # queue lock, so a meet_say append cannot land between the re-read and the rewrite.

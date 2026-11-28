@@ -4,10 +4,21 @@ from __future__ import annotations
 
 import re
 import threading
+import time
 from pathlib import Path
 from queue import Empty, SimpleQueue
+from typing import Callable
 
 _PUNCTUATION = " ,.!?;:—–-"
+_QUESTION_SETTLE_SECONDS = 1.0
+_LEAVE_COMMANDS = {
+    "leave the meeting",
+    "leave the call",
+    "please leave the meeting",
+    "please leave the call",
+    "disconnect",
+    "disconnect from the call",
+}
 
 
 def _answer(question: str) -> str:
@@ -45,13 +56,18 @@ def _answer(question: str) -> str:
 
 class CaptionWake:
     def __init__(self, bot_name: str, out_dir: Path, *, wake_session: str | None = None,
-                 wake_name: str | None = None, wake_aliases: tuple[str, ...] = ()) -> None:
+                 wake_name: str | None = None, wake_aliases: tuple[str, ...] = (),
+                 on_prompt: Callable[[str], str] | None = None,
+                 on_reply_queued: Callable[[], None] | None = None,
+                 can_queue_reply: Callable[[], bool] | None = None) -> None:
         word = wake_name
+        standalone = None
         if word is None:
             from hermes_cli.config import load_config_readonly
 
             options = load_config_readonly().get("plugins", {}).get("entries", {}).get("google_meet", {})
             word = options.get("wake_word", "Horizon")
+            standalone = options.get("wake_standalone")
             aliases = options.get("wake_aliases", [])
             if isinstance(aliases, list):
                 wake_aliases = (*wake_aliases, *aliases)
@@ -60,18 +76,24 @@ class CaptionWake:
         words = [word]
         words.extend(alias for alias in wake_aliases if isinstance(alias, str) and alias.isalpha())
         alternatives = "|".join(re.escape(word) for word in words)
-        self._wake = re.compile(rf"\bhey[\s,.:!?—–-]+(?:{alternatives})\b", re.IGNORECASE)
+        wake_pattern = rf"\bhey[\s,.:!?—–-]+(?:{alternatives})\b"
+        if isinstance(standalone, str) and standalone.isalpha():
+            wake_pattern += rf"|^{re.escape(standalone)}(?=$|[\s,.!?;:—–])"
+        self._wake = re.compile(wake_pattern, re.IGNORECASE)
         self._split_wake = re.compile(rf"(?:{alternatives})\b", re.IGNORECASE)
         self._bot_names = {bot_name.strip().casefold(), "you"} - {""}
         self._queue_path = out_dir / "say_queue.jsonl"
         self._wake_session = wake_session
+        self._on_prompt = on_prompt
+        self._on_reply_queued = on_reply_queued
+        self._can_queue_reply = can_queue_reply
         self._speaker: str | None = None
         self._parts: dict[int, str] = {}
         self._marker_row = -1
         self._last: tuple[str, int, str, float] | None = None
         self._updated = 0.0
         self._working = False
-        self._results: SimpleQueue[tuple[str, str | None]] = SimpleQueue()
+        self._results: SimpleQueue[tuple[str, str | None, int | None]] = SimpleQueue()
 
     def observe(self, entry: dict, now: float) -> None:
         row = entry.get("row")
@@ -112,44 +134,87 @@ class CaptionWake:
                 return
             self._updated = now
 
-    def poll(self, state, now: float) -> None:
+    def _pending_question(self) -> str | None:
+        if self._speaker is None:
+            return None
+        return " ".join(part for _, part in sorted(self._parts.items()) if part)[:500]
+
+    def next_settle_deadline(self) -> float | None:
+        """When an ordinary pending question can run, if no answer is in progress."""
+        if self._working:
+            return None
+        question = self._pending_question()
+        if not question or question.casefold().strip(_PUNCTUATION) in _LEAVE_COMMANDS:
+            return None
+        return self._updated + _QUESTION_SETTLE_SECONDS
+
+    def _settled_question(self, now: float) -> str | None:
+        question = self._pending_question()
+        if question is None or now < self._updated + (_QUESTION_SETTLE_SECONDS if question else 6):
+            return None
+        return question
+
+    def poll(self, state, now: float) -> bool:
+        """Handle ready captions and return true for an explicit request to leave."""
+        question = self._settled_question(now)
+        if question and question.casefold().strip(_PUNCTUATION) in _LEAVE_COMMANDS:
+            # Keep the longer settle time for commands that end the call.
+            if now - self._updated >= 2:
+                self._speaker, self._parts = None, {}
+                return True
+            question = None
+
         if self._working:
             try:
-                answer, error = self._results.get_nowait()
+                answer, error, text_ready_at_ns = self._results.get_nowait()
             except Empty:
-                return
+                return False
             self._working = False
             if answer:
-                from plugins.google_meet.process_manager import append_say
-                try:
-                    append_say(self._queue_path, answer)
-                except (OSError, TimeoutError):
-                    error = "Could not queue the spoken response."
+                error = self._enqueue_reply(answer, text_ready_at_ns)
             state.set(wake_error=error)
 
-        if self._speaker is None:
-            return
-        question = " ".join(part for _, part in sorted(self._parts.items()) if part)[:500]
-        if now - self._updated < (2 if question else 6):
-            return
+        if question is None:
+            return False
         self._speaker, self._parts = None, {}
-        if not question:
-            return
-        state.set(wake_questions=state.wake_questions + 1, wake_error=None)
-        self._working = True
-        threading.Thread(target=self._answer, args=(question,), name="meet-wake", daemon=True).start()
+        if question:
+            state.set(wake_questions=state.wake_questions + 1, wake_error=None)
+            self._working = True
+            threading.Thread(target=self._answer, args=(question,), name="meet-wake", daemon=True).start()
+        return False
+
+    def _enqueue_reply(self, answer: str, text_ready_at_ns: int | None) -> str | None:
+        if self._can_queue_reply is not None and not self._can_queue_reply():
+            return None
+        from plugins.google_meet.process_manager import append_say
+
+        try:
+            append_say(self._queue_path, answer, text_ready_at_ns=text_ready_at_ns)
+        except (OSError, TimeoutError):
+            return "Could not queue the spoken response."
+        if self._on_reply_queued is not None:
+            self._on_reply_queued()
+        return None
 
     def _answer(self, question: str) -> None:
         try:
-            if self._wake_session:
-                from plugins.google_meet.wake_chat import answer_in_chat
+            if self._on_prompt:
+                answer = self._on_prompt(question)
+            elif self._wake_session:
+                from plugins.meeting_wake_chat import answer_in_chat
 
                 answer = answer_in_chat(self._wake_session, question)
             else:
                 answer = _answer(question)
-            self._results.put((answer, None if answer else "The profile model returned an empty answer."))
+            text_ready_at_ns = time.time_ns() if answer else None
+            error = None if answer else "The profile model returned an empty answer."
+            if answer and self._on_reply_queued is not None:
+                # The local Google Meet speaker can accept the reply from this thread.
+                error = self._enqueue_reply(answer, text_ready_at_ns)
+                answer = ""
+            self._results.put((answer, error, text_ready_at_ns))
         except Exception as exc:
-            from plugins.google_meet.wake_chat import WakeChatError
+            from plugins.meeting_wake_chat import WakeChatError
 
             error = str(exc) if isinstance(exc, WakeChatError) else f"Profile model request failed ({type(exc).__name__})."
-            self._results.put(("", error))
+            self._results.put(("", error, None))

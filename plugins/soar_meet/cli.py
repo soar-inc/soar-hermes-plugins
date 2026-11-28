@@ -123,7 +123,7 @@ def _join(args):
     if args.wake_session:
         if not args.wake:
             raise ValueError("--wake-session requires --wake.")
-        from plugins.google_meet.wake_chat import validate_wake_chat
+        from plugins.meeting_wake_chat import validate_wake_chat
 
         validate_wake_chat(args.wake_session)
     if args.until is not None and args.until <= time.time():

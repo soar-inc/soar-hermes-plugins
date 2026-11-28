@@ -27,12 +27,13 @@ for plugin in google_meet soar_meet; do
 done
 ```
 
-Back up the existing plugin directories and watcher files. Then install both source directories and the two calendar files:
+Back up the existing plugin directories, shared wake-chat module, and watcher files. Then install the two plugin directories, the shared module, and the calendar files:
 
 ```bash
 for plugin in google_meet soar_meet; do
   cp -R "$integration_dir/plugins/$plugin" "$hermes_repo/plugins/"
 done
+install -m 644 "$integration_dir/plugins/meeting_wake_chat.py" "$hermes_repo/plugins/meeting_wake_chat.py"
 
 install -d -m 700 "$profile_dir/calendar-watcher" "$profile_dir/scripts"
 install -m 600 "$integration_dir/calendar-watcher/calendar_watcher.py"   "$profile_dir/calendar-watcher/calendar_watcher.py"
@@ -56,7 +57,7 @@ command -v paplay
 
 On this VM the PulseAudio socket is provided by `hermes-meet-audio.service`. An administrator can check it with `systemctl status hermes-meet-audio.service`. Use the VM's configured package management if Chromium prerequisites or PulseAudio tools are missing.
 
-Configure the Realtime credential as `HERMES_MEET_REALTIME_KEY` in the profile's private `.env` through the approved secret process. The plugin can also use `OPENAI_API_KEY`. For event chats, the profile needs a working model provider, the default Compressor context engine, and an enabled MCP server named `flowmind` with the approved endpoint. The shared wake-chat code accepts only `list_projects`, `list_tickets`, `count_tickets` and `get_ticket`, with MCP resources and prompts disabled. Merge these settings into the existing profile configuration.
+Configure the Realtime credential as `HERMES_MEET_REALTIME_KEY` in the profile's private `.env` through the approved secret process. The plugin can also use `OPENAI_API_KEY`. For event chats, the profile needs a working model provider, the default Compressor context engine, and an enabled MCP server named `flowmind` with the approved endpoint. The shared wake-chat code accepts an explicit read-only selection of `list_projects`, `list_tickets`, `count_tickets`, and `get_ticket`, or `include: ["*"]` for all native FlowMind tools. Disable MCP resources and prompts in either configuration. Merge these settings into the existing profile configuration.
 
 ## 3. Authorize the three accounts or sessions
 
