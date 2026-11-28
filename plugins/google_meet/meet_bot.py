@@ -18,6 +18,7 @@ import subprocess
 import sys
 import threading
 import time
+from contextlib import ExitStack
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Optional
@@ -67,6 +68,8 @@ _STATUS_FIELDS = (
     ("lastAudioOutAt", "last_audio_out_at", None), ("lastBargeInAt", "last_barge_in_at", None),
     ("wakeEnabled", "wake_enabled", False), ("wakeQuestions", "wake_questions", 0),
     ("wakeError", "wake_error", None), ("wakeSessionId", "wake_session_id", None),
+    ("presentationState", "presentation_state", None), ("presentationTab", "presentation_tab", None),
+    ("presentationError", "presentation_error", None),
     ("leaveReason", "leave_reason", None), ("micState", "mic_state", None))
 
 
@@ -108,8 +111,7 @@ class _BotState:
 # collects {speaker, text}; ``window.__hermesMeetDrain()`` pulls new entries.
 _CAPTION_OBSERVER_JS = r"""
 (() => {
-  if (window.__hermesMeetInstalled) return;
-  window.__hermesMeetInstalled = true;
+  if (typeof window.__hermesMeetDrain === 'function') return;
   window.__hermesMeetQueue = [];
   const rowsSeen = new WeakMap();
   let nextRow = 0;
@@ -132,32 +134,50 @@ _CAPTION_OBSERVER_JS = r"""
     });
   }
 
+  function visible(element) {
+    if (!element.getClientRects().length) return false;
+    if (typeof element.checkVisibility === 'function') {
+      return element.checkVisibility({checkOpacity: true, checkVisibilityCSS: true});
+    }
+    const style = getComputedStyle(element);
+    return style.visibility !== 'hidden' && style.visibility !== 'collapse';
+  }
+
   function scan(root) {
     // Meet captions render as rows of speaker label + text block. Selectors
     // vary across Meet rewrites; try a few shapes and fall back to raw text.
-    const rows = root.querySelectorAll('div[jsname="dsyhDe"], div.CNusmb, div.TBMuR');
+    const rows = root.querySelectorAll('div[jsname="dsyhDe"], div.CNusmb, div.TBMuR, div.nMcdL');
     if (rows.length) {
       rows.forEach((row) => {
-        const spkEl = row.querySelector('div.KcIKyf, div.zs7s8d, span[jsname="YSxPC"]');
-        const txtEl = row.querySelector('div.bh44bd, span[jsname="tgaKEf"], div.iTTPOb');
+        if (!visible(row)) return;
+        const spkEl = row.querySelector('div.KcIKyf, div.zs7s8d, span[jsname="YSxPC"], div.adE6rb');
+        const txtEl = row.querySelector('div.bh44bd, span[jsname="tgaKEf"], div.iTTPOb, div.ygicle');
         pushEntry(row, spkEl ? spkEl.innerText : '', txtEl ? txtEl.innerText : row.innerText);
       });
       return;
     }
-    // Fallback: treat the whole region's innerText as one anonymous line.
-    pushEntry(root, '', (root.innerText || '').split('\n').filter(Boolean).pop());
+    // Some layouts append a Close control or Closed status after the spoken text.
+    const lines = (root.innerText || '').split('\n').map(line => line.trim());
+    pushEntry(root, '', lines.filter(line => line && !/^(?:close|closed)$/i.test(line)).pop());
   }
 
-  let attached = null;
-  const observer = new MutationObserver(() => { if (attached) scan(attached); });
+  let attached = [];
+  const options = { childList: true, subtree: true, characterData: true };
+  const scanVisible = () => attached.filter(visible).forEach(scan);
+  const observer = new MutationObserver(scanVisible);
   function attach() {
-    const region = document.querySelector(captionSelector);
-    if (region === attached) return;
-    observer.disconnect();
-    attached = region;
-    if (!region) return;
-    observer.observe(region, { childList: true, subtree: true, characterData: true });
-    scan(region);
+    // Meet can leave a hidden copy mounted when switching between call layouts.
+    // Observe each visible region once, even if a legacy selector matches a child.
+    const candidates = Array.from(document.querySelectorAll(captionSelector)).filter(visible);
+    const regions = candidates.filter(region =>
+      !candidates.some(other => other !== region && other.contains(region)));
+    if (regions.length !== attached.length || regions.some((region, i) => region !== attached[i])) {
+      observer.disconnect();
+      attached = regions;
+      attached.forEach(region => observer.observe(region, options));
+    }
+    // Visibility can change without a text mutation, including on an existing row.
+    scanVisible();
   }
   attach();
   setInterval(attach, 500);
@@ -170,18 +190,41 @@ _CAPTION_OBSERVER_JS = r"""
 })();
 """
 
+_CAPTION_DRAIN_JS = "window.__hermesMeetDrain && window.__hermesMeetDrain()"
+_CAPTION_DRAIN_INTERVAL = 0.25
+_CAPTION_CHECK_INTERVAL = 5.0
+_CAPTIONS_MENU = re.compile(r"^captions\s+(?:and|&)\s+(?:speech\s+)?translation(?:\s*\([^)]+\))?$", re.I)
+_ENABLE_CAPTIONS = re.compile(r"^(?:(?:turn on|show) captions|turn captions on)(?:\s*\([^)]+\))?$", re.I)
+_DISABLE_CAPTIONS = re.compile(r"^(?:(?:turn off|hide) captions|turn captions off)(?:\s*\([^)]+\))?$", re.I)
+
 _LEAVE_CALL_JS = (
     "() => { const b = document.querySelector('button[aria-label*=\"eave call\"]');"
     " if (b) b.click(); }")
 
-# True once past the lobby: leave button, caption region (once our observer is installed)
-# or participant list visible.
+# Require visible controls from the in-call toolbar. The lobby can also
+# contain text or accessible labels mentioning participants.
 _ADMISSION_PROBE_JS = r"""
     (() => {
-      if (document.querySelector('button[aria-label*="eave call" i]')) return true;
-      if (window.__hermesMeetInstalled && document.querySelector(
-          '[role="region"][aria-label*="aption" i], div[jsname="YSxPC"], div[jsname="tgaKEf"]')) return true;
-      return !!document.querySelector('[aria-label*="articipants" i]');
+      const bodyText = document.body?.innerText || '';
+      const visible = (node) => node.getClientRects().length > 0
+        && getComputedStyle(node).visibility === 'visible'
+        && !node.closest('[aria-hidden="true"]');
+      const controls = [...document.querySelectorAll(
+        'button[aria-label], [role="button"][aria-label]'
+      )].filter(visible).map((node) => node.getAttribute('aria-label').trim());
+      const has = (pattern) => controls.some((label) => pattern.test(label));
+      if (/You can['’]t join this video call|You were removed from the meeting|No one responded to your request to join|Your request to join was denied/i.test(bodyText)) {
+        return 'denied';
+      }
+      if (/asking to join|you(?:'|’)ve asked to join|waiting to be admitted|waiting for (?:the )?host to let you in|someone will let you in soon|you(?:'|’)ll join when someone lets you in/i.test(bodyText)
+          || has(/^cancel (?:join )?request$/i)) {
+        return 'lobby';
+      }
+      if (has(/^(?:join now|ask to join|switch here)$/i)) return 'pending';
+
+      const leave = has(/^leave call(?:\s*\([^)]+\))?$/i);
+      const inCallControl = has(/^(?:show everyone|(?:turn (?:on|off)|show|hide) captions|turn captions (?:on|off)|present now|chat with everyone)(?:\s*\([^)]+\))?$/i);
+      return leave && inCallControl ? 'admitted' : 'pending';
     })();
     """
 
@@ -208,26 +251,12 @@ _PARTICIPANT_COUNT_JS = r"""
     """
 
 
-# English only — what Meet shows when the host denies or removes a guest.
-_DENIED_PROBE_JS = r"""
-    (() => {
-      const text = document.body ? document.body.innerText || '' : '';
-      return /You can't join this video call|You were removed from the meeting|No one responded to your request to join/i.test(text);
-    })();
-    """
-
-
-def _probe(page, js: str) -> bool:
-    """Evaluate a boolean JS probe; conservative — False on any error."""
-    return bool(_quiet(page.evaluate, js))
-
-
 def _visible(locator):
     """``locator.first`` if it exists and is visible, else None (swallows Playwright errors)."""
     return _quiet(lambda: locator.first if locator.first.count() and locator.first.is_visible() else None)
 
 
-def _pcm_tail_loop(proc, pcm_path: Path, stop_flag: dict, poll_interval: float = 0.05) -> None:
+def _pcm_tail_loop(proc, pcm_path: Path, stop_flag: dict, poll_interval: float = 0.005) -> None:
     """Follow ``speaker.pcm`` as it grows and forward every appended chunk to the pump's stdin.
     The pump itself would hit EOF on the (empty) file at start-up and exit; this thread keeps
     feeding it until the stop flag is set or the pump dies."""
@@ -285,7 +314,8 @@ def _start_pcm_pump(rt: dict, bridge_info: dict, pcm_path: Path, state: _BotStat
     rt["pcm_tail_thread"].start()
 
 
-def _start_realtime_speaker(rt: dict, cfg: _BotConfig, stop_flag: dict, state: _BotState) -> None:
+def _start_realtime_speaker(rt: dict, cfg: _BotConfig, stop_flag: dict, state: _BotState, *,
+                            queue_ready: threading.Event | None = None) -> None:
     """Wire up the OpenAI Realtime session, the say-queue speaker thread and the PCM pump."""
     pcm_path, queue_path = cfg.out_dir / "speaker.pcm", cfg.out_dir / "say_queue.jsonl"
     pcm_path.write_bytes(b"")  # clean sink file per session
@@ -307,7 +337,7 @@ def _start_realtime_speaker(rt: dict, cfg: _BotConfig, stop_flag: dict, state: _
 
     def _speaker_loop():
         try:
-            speaker.run_until_stopped(lambda: stop_flag.get("stop", False))
+            speaker.run_until_stopped(lambda: stop_flag.get("stop", False), queue_ready=queue_ready)
         except Exception as e:
             state.set(error=f"realtime speaker crashed: {e}")
 
@@ -357,40 +387,54 @@ def _teardown_realtime(rt: dict) -> None:
             _quiet(getattr(rt[key], method), **kw)
 
 
-_BotConfig = SimpleNamespace  # everything the bot reads from ``HERMES_MEET_*`` env vars
+_BotConfig = SimpleNamespace
 
 
 def _config_from_env() -> _BotConfig:
     env = os.environ.get
     out_raw = env("HERMES_MEET_OUT_DIR", "").strip()
+    realtime = env("HERMES_MEET_MODE", "transcribe").strip().lower() == "realtime"
+    realtime_model = env("HERMES_MEET_REALTIME_MODEL", "").strip()
+    if realtime and not realtime_model:
+        from hermes_cli.config import load_config_readonly
+
+        config = load_config_readonly()
+        meet_config = config.get("plugins", {}).get("entries", {}).get("google_meet", {})
+        configured_model = meet_config.get("realtime_model") if isinstance(meet_config, dict) else None
+        if isinstance(configured_model, str):
+            realtime_model = configured_model.strip()
     return _BotConfig(
         url=env("HERMES_MEET_URL", "").strip(),
         out_dir=Path(out_raw) if out_raw else None,
         headed=env("HERMES_MEET_HEADED", "").lower() in {"1", "true", "yes"},
         auth_state=env("HERMES_MEET_AUTH_STATE", "").strip(),
+        voice_share=env("HERMES_MEET_VOICE_SHARE") == "1",
         guest_name=env("HERMES_MEET_GUEST_NAME", "Hermes Agent"),
         duration_s=_parse_duration(env("HERMES_MEET_DURATION", "")),
-        realtime=env("HERMES_MEET_MODE", "transcribe").strip().lower() == "realtime",
+        realtime=realtime,
         # HERMES_MEET_REALTIME_KEY is resolved by process_manager.start() via the parent's
         # profile secret scope; OPENAI_API_KEY only serves standalone `python -m` runs.
         realtime_api_key=env("HERMES_MEET_REALTIME_KEY") or env("OPENAI_API_KEY", ""),
-        realtime_model=env("HERMES_MEET_REALTIME_MODEL", "gpt-realtime"),
+        realtime_model=realtime_model or "gpt-realtime",
         realtime_voice=env("HERMES_MEET_REALTIME_VOICE", "alloy"),
         realtime_instructions=env("HERMES_MEET_REALTIME_INSTRUCTIONS", ""),
         lobby_timeout=float(env("HERMES_MEET_LOBBY_TIMEOUT", "300")))
 
 
 def _join(page, cfg: _BotConfig, state: _BotState, timeout: float = 30.0) -> None:
-    """Fill the guest-name field and click 'Join now' / 'Ask to join' (the latter → lobby_waiting).
+    """Fill the guest-name field and click an available join control, including a voice-share handoff.
     Meet renders the pre-join buttons asynchronously after ``domcontentloaded``, so poll for up to
     *timeout* seconds instead of checking once — a single miss leaves the bot silently in the lobby."""
+    labels = ("Join now", "Ask to join")
+    if getattr(cfg, "voice_share", False):
+        labels += ("Switch here",)
     deadline = time.time() + timeout
     while True:
         name_box = _visible(page.locator('input[aria-label*="name" i]'))
         if name_box is not None:
             _quiet(name_box.fill, cfg.guest_name, timeout=2_000)
-        for label in ("Join now", "Ask to join"):
-            btn = _visible(page.get_by_role("button", name=label, exact=False))
+        for label in labels:
+            btn = _visible(page.get_by_role("button", name=label, exact=label == "Switch here"))
             if btn is not None and _quiet(lambda: (btn.click(timeout=3_000), True)):
                 if label == "Ask to join":
                     state.set(lobby_waiting=True)
@@ -398,6 +442,22 @@ def _join(page, cfg: _BotConfig, state: _BotState, timeout: float = 30.0) -> Non
         if time.time() >= deadline:
             return
         time.sleep(0.5)
+
+
+def _dismiss_meet_notice(page, title: str, button: str | re.Pattern[str]) -> None:
+    """Dismiss only the close control in a dialog with the expected title."""
+    heading = page.get_by_text(title, exact=True)
+    dialog = page.locator('dialog, [role="dialog"], [role="alertdialog"], [aria-modal="true"]').filter(has=heading)
+    dismiss = _visible(dialog.get_by_role("button", name=button, exact=True))
+    if dismiss is not None:
+        from tools.bot_desktop import lease
+
+        lease.assert_agent_may_act()
+        dismiss.click(timeout=2_000)
+
+
+def _dismiss_video_preview_tutorial(page) -> None:
+    _dismiss_meet_notice(page, "Others may see your video differently", "Got it")
 
 
 def _ensure_mic_on(page) -> str:
@@ -413,19 +473,88 @@ def _ensure_mic_on(page) -> str:
     return "unknown"
 
 
-def _start_captions(page, state: _BotState) -> None:
-    """Observe captions and turn them on in the admitted bot's own browser."""
-    try:
-        page.evaluate(_CAPTION_OBSERVER_JS)
+def _mark_captions_on(state: _BotState) -> None:
+    if state.error and state.error.startswith("caption setup failed:"):
+        state.set(captioning=True, error=None)
+    elif not state.captioning:
         state.set(captioning=True)
-        if _visible(page.get_by_role("button", name=re.compile(r"(turn off|hide) captions", re.I))):
+
+
+def _open_caption_menu(page) -> bool:
+    launcher = _visible(page.get_by_role("button", name=_CAPTIONS_MENU))
+    if launcher is None:
+        return False
+    from tools.bot_desktop import lease
+
+    lease.assert_agent_may_act()
+    return bool(_quiet(lambda: (launcher.hover(timeout=1_500), True)[1]))
+
+
+def _ensure_captions(page, state: _BotState, *, allow_shortcut: bool = False, confirm: bool = False) -> None:
+    """Enable an explicitly disabled caption control without toggling an enabled one."""
+    if confirm and not state.captioning:
+        # On a VM without a webcam, this notice can intercept the caption click.
+        _quiet(
+            _dismiss_meet_notice, page, "Camera not found",
+            re.compile(r"^(?:close|dismiss)(?: (?:notice|notification|dialog))?$", re.I),
+        )
+    enabled = page.get_by_role("button", name=_DISABLE_CAPTIONS)
+    if _visible(enabled):
+        _mark_captions_on(state)
+        return
+    disabled = page.get_by_role("button", name=_ENABLE_CAPTIONS)
+    toggle = _visible(disabled)
+    if confirm and not state.captioning and toggle is None and _open_caption_menu(page):
+        _quiet(enabled.or_(disabled).first.wait_for, state="visible", timeout=1_500)
+        if _visible(enabled):
+            _mark_captions_on(state)
             return
-        toggle = _visible(page.get_by_role("button", name=re.compile(r"(turn on|show) captions", re.I)))
-        if toggle is not None:
-            toggle.click(timeout=3_000)
+        toggle = _visible(disabled)
+    if toggle is not None:
+        if confirm:
+            from tools.bot_desktop import lease
+
+            lease.assert_agent_may_act()
+        if state.captioning:
+            state.set(captioning=False)
+        toggle.click(timeout=3_000)
+    elif allow_shortcut:
+        if confirm:
+            from plugins.google_meet.caption_shortcut import press_caption_shortcut
+
+            press_caption_shortcut(page)
         else:
             page.keyboard.press("c")
+    else:
+        return
+    if not state.captions_enabled_attempted:
         state.set(captions_enabled_attempted=True)
+    if confirm:
+        # Clicking the control can close the submenu before its label updates.
+        if not _visible(enabled):
+            _open_caption_menu(page)
+            _quiet(enabled.first.wait_for, state="visible", timeout=1_500)
+        if _visible(enabled):
+            _mark_captions_on(state)
+        elif state.error is None or state.error.startswith("caption setup failed:"):
+            state.set(error="caption setup failed: Meet did not confirm captions are on")
+
+
+def _start_captions(page, state: _BotState, *, allow_shortcut: bool = True, focus_tab: bool = False) -> None:
+    """Install the observer in the current document and enable its captions."""
+    try:
+        page.evaluate(_CAPTION_OBSERVER_JS)
+        if focus_tab:
+            from tools.bot_desktop import lease
+
+            lease.assert_agent_may_act()
+            page.bring_to_front()
+            page.evaluate("""() => {
+                // The persistent Chromium window can start with focus in the address bar.
+                if (!document.body.hasAttribute('tabindex')) document.body.tabIndex = -1;
+                document.body.focus({preventScroll: true});
+            }""")
+        _ensure_captions(page, state, allow_shortcut=allow_shortcut, confirm=focus_tab)
     except Exception as exc:
         state.set(error=f"caption setup failed: {exc}")
 
@@ -437,27 +566,42 @@ def _drain_loop(page, cfg: _BotConfig, state: _BotState, rt: dict, stop_flag: di
     lobby_deadline = time.time() + cfg.lobby_timeout
     last_admission_check = 0.0
     next_participant_check = 0.0
+    next_caption_check = 0.0
+    next_maintenance = 0.0
+    voice_share = getattr(cfg, "voice_share", False)
+    delayed_caption_attempts = 2 if voice_share else 0
     had_company = False
     alone_since = None
     wake = rt.get("wake")
     while not stop_flag["stop"]:
+        iteration_started = time.monotonic()
         now = time.time()
         if deadline and now > deadline:
             state.set(leave_reason="duration_expired")
             return
         if not state.in_call and (now - last_admission_check) > 3.0:
             last_admission_check = now
-            if _probe(page, _ADMISSION_PROBE_JS):
+            if voice_share:
+                _quiet(_dismiss_video_preview_tutorial, page)
+            admission = _quiet(page.evaluate, _ADMISSION_PROBE_JS)
+            if admission == "denied":
+                state.set(lobby_waiting=False, error="host denied admission", leave_reason="denied")
+                return
+            if admission == "admitted":
                 state.set(in_call=True, lobby_waiting=False, joined_at=now, mic_state=_ensure_mic_on(page))
-                _start_captions(page, state)
+                if (warm_up := rt.get("warm_up")) is not None:
+                    threading.Thread(target=warm_up, name="meet-warm-up", daemon=True).start()
+                # Meet can expose the in-call toolbar before its shortcuts are ready.
+                _start_captions(page, state, allow_shortcut=not voice_share, focus_tab=voice_share)
+                next_caption_check = time.monotonic() + _CAPTION_CHECK_INTERVAL
             elif now > lobby_deadline:
                 waited = int(lobby_deadline - state.join_attempted_at) if state.join_attempted_at else 0
-                state.set(error=f"lobby timeout — host never admitted the bot within {waited}s",
+                state.set(lobby_waiting=False,
+                          error=f"lobby timeout — host never admitted the bot within {waited}s",
                           leave_reason="lobby_timeout")
                 return
-            elif _probe(page, _DENIED_PROBE_JS):
-                state.set(error="host denied admission", leave_reason="denied")
-                return
+            elif admission == "lobby" and not state.lobby_waiting:
+                state.set(lobby_waiting=True)
         if state.in_call and time.monotonic() >= next_participant_check:
             participants = _quiet(page.evaluate, _PARTICIPANT_COUNT_JS)
             checked_at = time.monotonic()
@@ -472,27 +616,66 @@ def _drain_loop(page, cfg: _BotConfig, state: _BotState, rt: dict, stop_flag: di
                     return
             else:
                 alone_since = None
+        captions_current = False
         try:
-            queued = page.evaluate("window.__hermesMeetDrain && window.__hermesMeetDrain()")
+            queued = page.evaluate(_CAPTION_DRAIN_JS)
+            if state.in_call and time.monotonic() >= next_caption_check:
+                next_caption_check = time.monotonic() + _CAPTION_CHECK_INTERVAL
+                if queued is None:
+                    # A new document has no drain function. Wait for the in-call toolbar
+                    # before reinstalling so a reload into the lobby cannot trigger input.
+                    if state.captioning:
+                        state.set(captioning=False)
+                    if _quiet(page.evaluate, _ADMISSION_PROBE_JS) == "admitted":
+                        _start_captions(page, state, allow_shortcut=False)
+                elif delayed_caption_attempts and not state.captioning and not state.captions_enabled_attempted:
+                    # Allow one retry for focus failures before any toggle was sent.
+                    delayed_caption_attempts -= 1
+                    _quiet(_dismiss_video_preview_tutorial, page)
+                    _start_captions(page, state, focus_tab=True)
+                else:
+                    _ensure_captions(page, state, confirm=voice_share)
             for entry in (e for e in (queued if isinstance(queued, list) else ()) if isinstance(e, dict)):
                 speaker = str(entry.get("speaker", ""))
-                state.record_caption(speaker=speaker, text=str(entry.get("text", "")))
+                text = str(entry.get("text", ""))
+                if state.in_call and text.strip():
+                    _mark_captions_on(state)
+                state.record_caption(speaker=speaker, text=text)
                 if wake is not None and state.in_call:
                     wake.observe(entry, time.monotonic())
                 # Barge-in: a real human spoke while we may be generating audio.
                 if (rt["session"] is not None and _looks_like_human_speaker(speaker, cfg.guest_name)
                         and _quiet(rt["session"].cancel_response)):
                     state.set(last_barge_in_at=now)
+            captions_current = isinstance(queued, list)
         except Exception:
             if page.is_closed():  # Meet reloaded or we got booted — exit rather than spin
                 state.set(leave_reason="page_closed")
                 return
-        if wake is not None and state.in_call:
-            wake.poll(state, time.monotonic())
-        if rt["session"] is not None:
+        # Dispatch only after draining the live caption observer on this iteration.
+        if wake is not None and state.in_call and captions_current and wake.poll(state, time.monotonic()):
+            stop_flag["stop"] = True
+            state.set(leave_reason="voice_requested")
+            return
+        # Keep presentation polling and realtime status writes at their previous cadence.
+        maintenance_at = time.monotonic()
+        maintenance_due = maintenance_at >= next_maintenance
+        if maintenance_due:
+            next_maintenance = maintenance_at + 1.0
+            if (presentation := rt.get("presentation")) is not None and state.in_call:
+                _quiet(presentation.poll)
+        if maintenance_due and rt["session"] is not None:
             state.set(audio_bytes_out=rt["session"].audio_bytes_out,
                       last_audio_out_at=rt["session"].last_audio_out_at)
-        time.sleep(1.0)
+        if state.in_call:
+            next_iteration = iteration_started + _CAPTION_DRAIN_INTERVAL
+            if wake is not None and captions_current:
+                settle_deadline = wake.next_settle_deadline()
+                if isinstance(settle_deadline, (float, int)):
+                    next_iteration = min(next_iteration, settle_deadline)
+            time.sleep(max(0.0, next_iteration - time.monotonic()))
+        else:
+            time.sleep(1.0)
 
 
 _CONTEXT_ARGS = {
@@ -530,23 +713,63 @@ def run_bot() -> int:
         if rt["bridge"]:
             rt["bridge"].teardown()
         return 3
+    from plugins.google_meet.chrome_profile import meet_chrome_profile, persistent_chrome_enabled
+
+    use_persistent_chrome = cfg.voice_share or persistent_chrome_enabled()
     chrome_args = ["--use-fake-ui-for-media-stream", "--disable-blink-features=AutomationControlled"]
+    native_picker = False
+    if cfg.voice_share:
+        chrome_args.remove("--use-fake-ui-for-media-stream")
+        from hermes_constants import get_hermes_home
+        from plugins.google_meet.presentation import capture_browser_config
+        from plugins.google_meet.voice_tools import uses_computer_use_picker
+
+        native_picker = uses_computer_use_picker(Path(get_hermes_home()))
+        capture_key, capture_guard = capture_browser_config(cfg.url, native_picker=native_picker)
+        if native_picker:
+            chrome_args.append("--start-maximized")
+        else:
+            chrome_args.append(f"--auto-select-tab-capture-source-by-title={capture_key}")
     if not rt["enabled"]:
         chrome_args.insert(1, "--use-fake-device-for-media-stream")  # silent fake mic
     elif rt["bridge_info"] and rt["bridge_info"].get("platform") == "linux":
         # Playwright's launch() takes no env: set PULSE_SOURCE on ourselves so Chrome inherits it.
         os.environ["PULSE_SOURCE"] = rt["bridge_info"].get("device_name", "")
     context_args = dict(_CONTEXT_ARGS)
-    if cfg.auth_state and Path(cfg.auth_state).is_file():
-        context_args["storage_state"] = cfg.auth_state
+    if use_persistent_chrome:
+        context_args.pop("permissions")
+        context_args.pop("user_agent")  # Keep the same browser identity used by the sign-in helper.
+    if cfg.voice_share:
+        # Fit the in-call toolbar inside the real Bot Screen browser window.
+        context_args.pop("viewport")
+        context_args["no_viewport"] = True
+        context_args["service_workers"] = "block"
+    auth_state = cfg.auth_state if cfg.auth_state and Path(cfg.auth_state).is_file() else None
     try:
-        with sync_playwright() as pw:
-            browser = pw.chromium.launch(
-                channel="chromium", executable_path=chromium_executable(),
-                headless=not cfg.headed, args=chrome_args,
-            )
-            context = browser.new_context(**context_args)
-            page = context.new_page()
+        with sync_playwright() as pw, ExitStack() as stack:
+            launch_args = dict(channel="chromium", executable_path=chromium_executable(),
+                               headless=not cfg.headed, args=chrome_args)
+            if use_persistent_chrome:
+                from plugins.google_meet.presentation import seed_legacy_flowmind
+
+                profile = stack.enter_context(meet_chrome_profile())
+                if cfg.voice_share:
+                    launch_args["ignore_default_args"] = ["--disable-infobars"]
+                context = pw.chromium.launch_persistent_context(profile, **launch_args, **context_args)
+                stack.callback(_quiet, context.close)
+                seed_legacy_flowmind(context, profile)
+                context.grant_permissions(["microphone", "camera"], origin="https://meet.google.com")
+                if cfg.voice_share:
+                    context.add_init_script(capture_guard)
+                page = context.pages[0]
+            else:
+                browser = pw.chromium.launch(**launch_args)
+                stack.callback(_quiet, browser.close)
+                if auth_state:
+                    context_args["storage_state"] = auth_state
+                context = browser.new_context(**context_args)
+                stack.callback(_quiet, context.close)
+                page = context.new_page()
             try:
                 page.goto(cfg.url, wait_until="domcontentloaded", timeout=30_000)
             except Exception as e:
@@ -555,17 +778,41 @@ def run_bot() -> int:
             _join(page, cfg, state)
             state.set(join_attempted_at=time.time())
             if rt["enabled"]:
-                _start_realtime_speaker(rt, cfg, stop_flag, state)
+                queue_ready = threading.Event()
+                _start_realtime_speaker(rt, cfg, stop_flag, state, queue_ready=queue_ready)
                 if state.realtime_ready and os.environ.get("HERMES_MEET_WAKE") == "1":
                     wake_session = os.environ.get("HERMES_MEET_WAKE_SESSION") or None
-                    rt["wake"] = CaptionWake(cfg.guest_name, cfg.out_dir, wake_session=wake_session)
+                    on_prompt = None
+                    if cfg.voice_share:
+                        from plugins.google_meet.agent_turn import MeetAgentTurn
+                        from plugins.google_meet.presentation import Presentation
+
+                        presentation = Presentation(
+                            page, state, capture_key=capture_key, native_picker=native_picker,
+                        )
+                        rt["presentation"] = presentation
+                        on_prompt = MeetAgentTurn(presentation, wake_session)
+                        rt["warm_up"] = on_prompt.warm_up
+                        rt["close_agent_turn"] = on_prompt.close
+                        state.set(presentation_state="idle")
+                    rt["wake"] = CaptionWake(
+                        cfg.guest_name, cfg.out_dir, wake_session=wake_session, on_prompt=on_prompt,
+                        on_reply_queued=queue_ready.set,
+                        can_queue_reply=lambda: state.in_call and not stop_flag["stop"],
+                    )
                     state.set(wake_enabled=True, wake_session_id=wake_session)
-            _drain_loop(page, cfg, state, rt, stop_flag)
+            try:
+                _drain_loop(page, cfg, state, rt, stop_flag)
+            finally:
+                stop_flag["stop"] = True
+                if (presentation := rt.get("presentation")) is not None:
+                    presentation.close()
+                if (close_agent_turn := rt.get("close_agent_turn")) is not None:
+                    _quiet(close_agent_turn)
             _quiet(page.evaluate, _LEAVE_CALL_JS)
-            context.close()
-            browser.close()
+            stack.close()
             _teardown_realtime(rt)
-            state.set(in_call=False, captioning=False, exited=True)
+            state.set(in_call=False, lobby_waiting=False, captioning=False, exited=True)
             return 0
     except Exception as e:
         state.set(error=f"unhandled: {e}", exited=True)
